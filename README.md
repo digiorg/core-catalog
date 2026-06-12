@@ -1,4 +1,4 @@
-# digiorg/core-app-catalog
+# digiorg/core-catalog
 
 Crossplane Compositions for DigiOrg App Templates.
 
@@ -9,7 +9,7 @@ DigiOrg's platform is split across two repositories:
 | Repo | Responsibility |
 |------|---------------|
 | `digiorg/core` | XRDs, Providers, ProviderConfigs, platform infrastructure (ArgoCD, cert-manager, ingress, etc.) |
-| `digiorg/core-app-catalog` *(this repo)* | Crossplane **Compositions** — the implementations that fulfil AppClaims |
+| `digiorg/core-catalog` *(this repo)* | Crossplane **Compositions** — the implementations that fulfil AppClaims |
 
 The XRD (`platform.digiorg.io/v1alpha1` / `Application` / `AppClaim`) lives in
 [`digiorg/core` → `crossplane/xrds/application.yaml`](https://github.com/digiorg/core/blob/main/crossplane/xrds/application.yaml).
@@ -38,7 +38,7 @@ individual Composition files as they are implemented:
 
 | File | Issue | Description |
 |------|-------|-------------|
-| `base.yaml` | [#2](https://github.com/digiorg/core-app-catalog/issues/2) | Namespace, ServiceAccount, RBAC, NetworkPolicy |
+| `base.yaml` | [#2](https://github.com/digiorg/core-catalog/issues/2) | Namespace, ServiceAccount, RBAC, NetworkPolicy |
 | `database.yaml` | C-5 | CNPG PostgreSQL Cluster |
 | `service.yaml` | C-6 | Deployment, Service, Ingress |
 | `gitea.yaml` | C-7 | Gitea Repository + Actions Pipeline via provider-http |
@@ -72,7 +72,7 @@ used by the Compositions.
 
 `digiorg/core` manages this repository as an ArgoCD Application:
 
-- **File**: `apps/platform/core-app-catalog.yaml`
+- **File**: `apps/platform/core-catalog.yaml` (renamed from `core-app-catalog.yaml` — see [digiorg/core#254](https://github.com/digiorg/core/issues/254))
 - **Sync Wave**: 8 (after XRDs and Providers are ready)
 - ArgoCD applies the `compositions/local/kustomization.yaml` to the cluster, which activates
   whichever Compositions are listed (uncommented) under `resources:`.
