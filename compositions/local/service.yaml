@@ -9,235 +9,243 @@ spec:
   compositeTypeRef:
     apiVersion: platform.digiorg.io/v1alpha1
     kind: Application
-  resources:
+  mode: Pipeline
+  pipeline:
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
 
-    # 1. Deployment
-    - name: deployment
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: apps/v1
-              kind: Deployment
-              metadata:
-                name: placeholder
-                namespace: placeholder
+          # 1. Deployment
+          - name: deployment
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
               spec:
-                replicas: 1
-                selector:
-                  matchLabels:
-                    app: placeholder
-                template:
-                  metadata:
-                    labels:
-                      app: placeholder
-                      platform.digiorg.io/app: placeholder
-                  spec:
-                    serviceAccountName: placeholder
-                    containers:
-                      - name: app
-                        image: placeholder
-                        ports:
-                          - containerPort: 8080
-                        resources:
-                          requests:
-                            cpu: "50m"
-                            memory: "64Mi"
-                          limits:
-                            cpu: "200m"
-                            memory: "256Mi"
-          providerConfigRef:
-            name: default
-      patches:
-        # Namespace = appName
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        # Deployment name = services[0].name
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.metadata.name
-        # selector.matchLabels.app = services[0].name
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.spec.selector.matchLabels.app
-        # template.labels.app = services[0].name
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.spec.template.metadata.labels.app
-        # template.labels platform.digiorg.io/app = appName
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.spec.template.metadata.labels[platform.digiorg.io/app]
-        # serviceAccountName = <appName>-sa
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.serviceAccountName
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-sa"
-        # image = services[0].image
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].image
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].image
-        # containerPort = services[0].port
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].port
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].ports[0].containerPort
-        # replicas per T-shirt size
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.spec.replicas
-          transforms:
-            - type: map
-              map:
-                S: 1
-                M: 2
-                L: 3
-        # CPU request per T-shirt size
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.requests.cpu
-          transforms:
-            - type: map
-              map:
-                S: "50m"
-                M: "200m"
-                L: "500m"
-        # CPU limit per T-shirt size
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.limits.cpu
-          transforms:
-            - type: map
-              map:
-                S: "200m"
-                M: "500m"
-                L: "2000m"
-        # Memory request per T-shirt size
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.requests.memory
-          transforms:
-            - type: map
-              map:
-                S: "64Mi"
-                M: "256Mi"
-                L: "512Mi"
-        # Memory limit per T-shirt size
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.limits.memory
-          transforms:
-            - type: map
-              map:
-                S: "256Mi"
-                M: "512Mi"
-                L: "2Gi"
+                forProvider:
+                  manifest:
+                    apiVersion: apps/v1
+                    kind: Deployment
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                    spec:
+                      replicas: 1
+                      selector:
+                        matchLabels:
+                          app: placeholder
+                      template:
+                        metadata:
+                          labels:
+                            app: placeholder
+                            platform.digiorg.io/app: placeholder
+                        spec:
+                          serviceAccountName: placeholder
+                          containers:
+                            - name: app
+                              image: placeholder
+                              ports:
+                                - containerPort: 8080
+                              resources:
+                                requests:
+                                  cpu: "50m"
+                                  memory: "64Mi"
+                                limits:
+                                  cpu: "200m"
+                                  memory: "256Mi"
+                providerConfigRef:
+                  name: default
+            patches:
+              # Namespace = appName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              # Deployment name = services[0].name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.metadata.name
+              # selector.matchLabels.app = services[0].name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.spec.selector.matchLabels.app
+              # template.labels.app = services[0].name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.spec.template.metadata.labels.app
+              # template.labels platform.digiorg.io/app = appName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.spec.template.metadata.labels[platform.digiorg.io/app]
+              # serviceAccountName = <appName>-sa
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.serviceAccountName
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-sa"
+              # image = services[0].image
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].image
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].image
+              # containerPort = services[0].port
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].port
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].ports[0].containerPort
+              # replicas per T-shirt size
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.spec.replicas
+                transforms:
+                  - type: map
+                    map:
+                      S: 1
+                      M: 2
+                      L: 3
+              # CPU request per T-shirt size
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.requests.cpu
+                transforms:
+                  - type: map
+                    map:
+                      S: "50m"
+                      M: "200m"
+                      L: "500m"
+              # CPU limit per T-shirt size
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.limits.cpu
+                transforms:
+                  - type: map
+                    map:
+                      S: "200m"
+                      M: "500m"
+                      L: "2000m"
+              # Memory request per T-shirt size
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.requests.memory
+                transforms:
+                  - type: map
+                    map:
+                      S: "64Mi"
+                      M: "256Mi"
+                      L: "512Mi"
+              # Memory limit per T-shirt size
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.spec.template.spec.containers[0].resources.limits.memory
+                transforms:
+                  - type: map
+                    map:
+                      S: "256Mi"
+                      M: "512Mi"
+                      L: "2Gi"
 
-    # 2. Service (ClusterIP)
-    - name: service
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: v1
-              kind: Service
-              metadata:
-                name: placeholder
-                namespace: placeholder
+          # 2. Service (ClusterIP)
+          - name: service
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
               spec:
-                selector:
-                  app: placeholder
-                ports:
-                  - port: 80
-                    targetPort: 8080
-                type: ClusterIP
-          providerConfigRef:
-            name: default
-      patches:
-        # Namespace = appName
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        # Service name = <services[0].name>-svc
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-svc"
-        # selector.app = services[0].name
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.spec.selector.app
-        # targetPort = services[0].port
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].port
-          toFieldPath: spec.forProvider.manifest.spec.ports[0].targetPort
+                forProvider:
+                  manifest:
+                    apiVersion: v1
+                    kind: Service
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                    spec:
+                      selector:
+                        app: placeholder
+                      ports:
+                        - port: 80
+                          targetPort: 8080
+                      type: ClusterIP
+                providerConfigRef:
+                  name: default
+            patches:
+              # Namespace = appName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              # Service name = <services[0].name>-svc
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-svc"
+              # selector.app = services[0].name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.spec.selector.app
+              # targetPort = services[0].port
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].port
+                toFieldPath: spec.forProvider.manifest.spec.ports[0].targetPort
 
-    # 3. Ingress (nginx)
-    - name: ingress
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: networking.k8s.io/v1
-              kind: Ingress
-              metadata:
-                name: placeholder
-                namespace: placeholder
-                annotations:
-                  nginx.ingress.kubernetes.io/rewrite-target: /
+          # 3. Ingress (nginx)
+          - name: ingress
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
               spec:
-                ingressClassName: nginx
-                rules:
-                  - host: placeholder.digiorg.local
-                    http:
-                      paths:
-                        - path: /
-                          pathType: Prefix
-                          backend:
-                            service:
-                              name: placeholder-svc
-                              port:
-                                number: 80
-          providerConfigRef:
-            name: default
-      patches:
-        # Namespace = appName
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        # Ingress name = <appName>-ingress
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-ingress"
-        # Host = <appName>.digiorg.local
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.spec.rules[0].host
-          transforms:
-            - type: string
-              string:
-                fmt: "%s.digiorg.local"
-        # Backend service name = <services[0].name>-svc
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.services[0].name
-          toFieldPath: spec.forProvider.manifest.spec.rules[0].http.paths[0].backend.service.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-svc"
+                forProvider:
+                  manifest:
+                    apiVersion: networking.k8s.io/v1
+                    kind: Ingress
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                      annotations:
+                        nginx.ingress.kubernetes.io/rewrite-target: /
+                    spec:
+                      ingressClassName: nginx
+                      rules:
+                        - host: placeholder.digiorg.local
+                          http:
+                            paths:
+                              - path: /
+                                pathType: Prefix
+                                backend:
+                                  service:
+                                    name: placeholder-svc
+                                    port:
+                                      number: 80
+                providerConfigRef:
+                  name: default
+            patches:
+              # Namespace = appName
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              # Ingress name = <appName>-ingress
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-ingress"
+              # Host = <appName>.digiorg.local
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.spec.rules[0].host
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s.digiorg.local"
+              # Backend service name = <services[0].name>-svc
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.services[0].name
+                toFieldPath: spec.forProvider.manifest.spec.rules[0].http.paths[0].backend.service.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-svc"

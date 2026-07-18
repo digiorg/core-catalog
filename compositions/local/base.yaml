@@ -8,189 +8,197 @@ spec:
   compositeTypeRef:
     apiVersion: platform.digiorg.io/v1alpha1
     kind: Application
-  resources:
+  mode: Pipeline
+  pipeline:
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
 
-    # 1. Namespace
-    - name: namespace
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: v1
-              kind: Namespace
-              metadata:
-                name: placeholder
-                labels:
-                  app.kubernetes.io/managed-by: crossplane
-                  platform.digiorg.io/team: placeholder
-                  platform.digiorg.io/size: placeholder
-          providerConfigRef:
-            name: default
-      patches:
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.team
-          toFieldPath: spec.forProvider.manifest.metadata.labels[platform.digiorg.io/team]
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.size
-          toFieldPath: spec.forProvider.manifest.metadata.labels[platform.digiorg.io/size]
-
-    # 2. ServiceAccount
-    - name: serviceaccount
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: v1
-              kind: ServiceAccount
-              metadata:
-                name: placeholder
-                namespace: placeholder
-          providerConfigRef:
-            name: default
-      patches:
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-sa"
-
-    # 3. Role
-    - name: role
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: rbac.authorization.k8s.io/v1
-              kind: Role
-              metadata:
-                name: placeholder
-                namespace: placeholder
-              rules:
-                - apiGroups: [""]
-                  resources: ["pods", "pods/log"]
-                  verbs: ["get", "list", "watch"]
-                - apiGroups: [""]
-                  resources: ["configmaps"]
-                  verbs: ["get", "list"]
-                - apiGroups: [""]
-                  resources: ["secrets"]
-                  verbs: ["get"]
-          providerConfigRef:
-            name: default
-      patches:
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-role"
-
-    # 4. RoleBinding
-    - name: rolebinding
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: rbac.authorization.k8s.io/v1
-              kind: RoleBinding
-              metadata:
-                name: placeholder
-                namespace: placeholder
-              roleRef:
-                apiGroup: rbac.authorization.k8s.io
-                kind: Role
-                name: placeholder
-              subjects:
-                - kind: ServiceAccount
-                  name: placeholder
-                  namespace: placeholder
-          providerConfigRef:
-            name: default
-      patches:
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-binding"
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.roleRef.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-role"
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.subjects[0].name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-sa"
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.subjects[0].namespace
-
-    # 5. NetworkPolicy
-    - name: networkpolicy
-      base:
-        apiVersion: kubernetes.crossplane.io/v1alpha2
-        kind: Object
-        spec:
-          forProvider:
-            manifest:
-              apiVersion: networking.k8s.io/v1
-              kind: NetworkPolicy
-              metadata:
-                name: placeholder
-                namespace: placeholder
+          # 1. Namespace
+          - name: namespace
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
               spec:
-                podSelector: {}
-                policyTypes:
-                  - Ingress
-                ingress:
-                  # Allow traffic from ingress-nginx namespace
-                  - from:
-                      - namespaceSelector:
-                          matchLabels:
-                            kubernetes.io/metadata.name: ingress-nginx
-                  # Allow intra-namespace communication
-                  - from:
-                      - podSelector: {}
-          providerConfigRef:
-            name: default
-      patches:
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.namespace
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: spec.forProvider.manifest.metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-netpol"
+                forProvider:
+                  manifest:
+                    apiVersion: v1
+                    kind: Namespace
+                    metadata:
+                      name: placeholder
+                      labels:
+                        app.kubernetes.io/managed-by: crossplane
+                        platform.digiorg.io/team: placeholder
+                        platform.digiorg.io/size: placeholder
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.team
+                toFieldPath: spec.forProvider.manifest.metadata.labels[platform.digiorg.io/team]
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.size
+                toFieldPath: spec.forProvider.manifest.metadata.labels[platform.digiorg.io/size]
+
+          # 2. ServiceAccount
+          - name: serviceaccount
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: v1
+                    kind: ServiceAccount
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-sa"
+
+          # 3. Role
+          - name: role
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: rbac.authorization.k8s.io/v1
+                    kind: Role
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                    rules:
+                      - apiGroups: [""]
+                        resources: ["pods", "pods/log"]
+                        verbs: ["get", "list", "watch"]
+                      - apiGroups: [""]
+                        resources: ["configmaps"]
+                        verbs: ["get", "list"]
+                      - apiGroups: [""]
+                        resources: ["secrets"]
+                        verbs: ["get"]
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-role"
+
+          # 4. RoleBinding
+          - name: rolebinding
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: rbac.authorization.k8s.io/v1
+                    kind: RoleBinding
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                    roleRef:
+                      apiGroup: rbac.authorization.k8s.io
+                      kind: Role
+                      name: placeholder
+                    subjects:
+                      - kind: ServiceAccount
+                        name: placeholder
+                        namespace: placeholder
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-binding"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.roleRef.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-role"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.subjects[0].name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-sa"
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.subjects[0].namespace
+
+          # 5. NetworkPolicy
+          - name: networkpolicy
+            base:
+              apiVersion: kubernetes.crossplane.io/v1alpha2
+              kind: Object
+              spec:
+                forProvider:
+                  manifest:
+                    apiVersion: networking.k8s.io/v1
+                    kind: NetworkPolicy
+                    metadata:
+                      name: placeholder
+                      namespace: placeholder
+                    spec:
+                      podSelector: {}
+                      policyTypes:
+                        - Ingress
+                      ingress:
+                        # Allow traffic from ingress-nginx namespace
+                        - from:
+                            - namespaceSelector:
+                                matchLabels:
+                                  kubernetes.io/metadata.name: ingress-nginx
+                        # Allow intra-namespace communication
+                        - from:
+                            - podSelector: {}
+                providerConfigRef:
+                  name: default
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.namespace
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: spec.forProvider.manifest.metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-netpol"
