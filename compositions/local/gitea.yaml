@@ -9,47 +9,55 @@ spec:
   compositeTypeRef:
     apiVersion: platform.digiorg.io/v1alpha1
     kind: Application
-  resources:
+  mode: Pipeline
+  pipeline:
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
 
-    # Gitea Repository via provider-http DisposableRequest
-    - name: gitea-repo
-      base:
-        apiVersion: http.crossplane.io/v1alpha1
-        kind: DisposableRequest
-        metadata:
-          name: placeholder
-        spec:
-          deletionPolicy: Orphan
-          forProvider:
-            url: http://gitea.digiorg.local:8080/api/v1/user/repos
-            method: POST
-            headers:
-              Content-Type:
-                - application/json
-              # TODO: Replace 'changeme' with actual token.
-              # Create Secret: kubectl create secret generic gitea-admin-token -n crossplane-system --from-literal=token=<your-token>
-              # In a future iteration, use ExternalSecret + patch to inject this value.
-              Authorization:
-                - Bearer changeme
-            body: '{"name":"placeholder","description":"placeholder","private":true,"auto_init":true,"default_branch":"main"}'
-          providerConfigRef:
-            name: default
-      patches:
-        # DisposableRequest name = <appName>-gitea-repo
-        - type: FromCompositeFieldPath
-          fromFieldPath: spec.appName
-          toFieldPath: metadata.name
-          transforms:
-            - type: string
-              string:
-                fmt: "%s-gitea-repo"
-        # JSON body with appName and team
-        - type: CombineFromComposite
-          combine:
-            variables:
-              - fromFieldPath: spec.appName
-              - fromFieldPath: spec.team
-            strategy: string
-            string:
-              fmt: '{"name":"%s","description":"Repository for app %s (team: %s)","private":true,"auto_init":true,"default_branch":"main"}'
-          toFieldPath: spec.forProvider.body
+          # Gitea Repository via provider-http DisposableRequest
+          - name: gitea-repo
+            base:
+              apiVersion: http.crossplane.io/v1alpha1
+              kind: DisposableRequest
+              metadata:
+                name: placeholder
+              spec:
+                deletionPolicy: Orphan
+                forProvider:
+                  url: http://gitea.digiorg.local:8080/api/v1/user/repos
+                  method: POST
+                  headers:
+                    Content-Type:
+                      - application/json
+                    # TODO: Replace 'changeme' with actual token.
+                    # Create Secret: kubectl create secret generic gitea-admin-token -n crossplane-system --from-literal=token=<your-token>
+                    # In a future iteration, use ExternalSecret + patch to inject this value.
+                    Authorization:
+                      - Bearer changeme
+                  body: '{"name":"placeholder","description":"placeholder","private":true,"auto_init":true,"default_branch":"main"}'
+                providerConfigRef:
+                  name: default
+            patches:
+              # DisposableRequest name = <appName>-gitea-repo
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.appName
+                toFieldPath: metadata.name
+                transforms:
+                  - type: string
+                    string:
+                      fmt: "%s-gitea-repo"
+              # JSON body with appName and team
+              - type: CombineFromComposite
+                combine:
+                  variables:
+                    - fromFieldPath: spec.appName
+                    - fromFieldPath: spec.team
+                  strategy: string
+                  string:
+                    fmt: '{"name":"%s","description":"Repository for app %s (team: %s)","private":true,"auto_init":true,"default_branch":"main"}'
+                toFieldPath: spec.forProvider.body
