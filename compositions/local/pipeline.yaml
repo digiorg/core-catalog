@@ -1,0 +1,1691 @@
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: application-pipeline-local
+  labels:
+    platform.digiorg.io/target: local
+spec:
+  compositeTypeRef:
+    apiVersion: platform.digiorg.io/v1alpha1
+    kind: Application
+  mode: Pipeline
+  pipeline:
+    - step: render
+      functionRef:
+        name: function-kcl
+      input:
+        apiVersion: krm.kcl.dev/v1alpha1
+        kind: KCLInput
+        spec:
+          source: |
+            import regex
+            import base64
+            import json
+            import yaml
+
+            # =============================================================================
+            # DigiOrg AppClaim deterministic pipeline (crossplane-contrib/function-kcl)
+            #
+            # One Composition renders every capability an AppClaim can request, gated by
+            # its own enabled/cicd flags, and iterating over every entry of services[]
+            # and messaging.subjects[] (no index-0 truncation). Disabled capabilities
+            # contribute no resources. See core-catalog/README.md for the full contract.
+            # =============================================================================
+
+            params = option("params")
+            oxr = params.oxr
+            xspec = oxr.spec
+            # Crossplane v2 deprecates the v1-only "ExtraResources" pipeline mechanism in
+            # favor of "RequiredResources" (see crossplane-contrib/function-kcl fn.go,
+            # which maps meta.krm.kcl.dev/v1alpha1 RequiredResources items onto
+            # fnv1.Requirements.Resources -- the v2-compatible field. The platform runs
+            # Crossplane 2.3.3, so RequiredResources is used here, not ExtraResources).
+            required = params?.requiredResources or {}
+            # Issue #285 (automatic image promotion): observed composed resources
+            # from the *previous* reconcile -- this is how the Gitea-HEAD and
+            # Harbor-artifact Requests defined below (section 3b) become
+            # readable here, one reconcile after Crossplane has created and
+            # itself reconciled them (crossplane-contrib/function-kcl README
+            # "Extract Data from a Specific Composed Resource": `option("params")
+            # .ocds["<resource-name>"].Resource.status...`).
+            ocds = params?.ocds or {}
+
+            appName = xspec.appName
+            team = xspec.team
+            size = xspec.size
+
+            # ---- T-shirt size resolution (folds functions/size-resolver into this single
+            #      pipeline rather than a second function hop) ----
+            sizeTable = {
+                S = {cpuRequest = "50m", cpuLimit = "200m", memRequest = "64Mi", memLimit = "256Mi", storage = "1Gi", instances = 1, replicas = 1}
+                M = {cpuRequest = "200m", cpuLimit = "500m", memRequest = "256Mi", memLimit = "512Mi", storage = "5Gi", instances = 1, replicas = 2}
+                L = {cpuRequest = "500m", cpuLimit = "2000m", memRequest = "512Mi", memLimit = "2Gi", storage = "20Gi", instances = 2, replicas = 3}
+            }
+            sizing = sizeTable[size]
+
+            # Issue #285 (TLS hardening): every credential-bearing Gitea/Harbor
+            # call goes through the trusted digiorg.local ingress (CA:
+            # cert-manager/digiorg-local-ca-secret), never a raw in-cluster
+            # plain-HTTP Service address. The shared provider-http
+            # ProviderConfig (core/crossplane/providers/configs/provider-http-
+            # config.yaml) carries spec.tls.caCertSecretRef for this CA, so
+            # every Request below inherits verified TLS without repeating the
+            # trust config per-Request.
+            giteaApiBase = "https://digiorg.local/gitea/api/v1"
+            harborApiBase = "https://digiorg.local/api/v2.0"
+            harborRegistry = "digiorg.local"
+            # Path a mounted copy of the digiorg-local CA is available at
+            # inside every ephemeral Gitea Actions job container (act_runner
+            # v0.6.1 container.options bind-mount, see
+            # core/platform/base/gitea-actions-runner/deployment.yaml) -- so
+            # actions/checkout's git clone (GIT_SSL_CAINFO) and any Node-based
+            # step (NODE_EXTRA_CA_CERTS) both trust the same CA the runner
+            # itself and Backstage already trust.
+            jobContainerCaCertPath = "/etc/digiorg/ca/ca.crt"
+
+            resourceName = lambda slug: str -> str {
+                "${appName}-${slug}"
+            }
+
+            annotationFor = lambda slug: str -> {str:str} {
+                {"krm.kcl.dev/composition-resource-name" = slug}
+            }
+
+            k8sObject = lambda slug: str, manifest: any -> any {
+                {
+                    apiVersion = "kubernetes.crossplane.io/v1alpha2"
+                    kind = "Object"
+                    metadata.name = resourceName(slug)
+                    metadata.annotations = annotationFor(slug)
+                    spec.forProvider.manifest = manifest
+                    spec.providerConfigRef.name = "default"
+                }
+            }
+
+            # Issue #285 blocker (CI shell injection): standard POSIX single-quote
+            # escaping (as used by e.g. Python's shlex.quote/shell-quote libraries)
+            # -- wrapping a value in single quotes suppresses every shell special
+            # character (including `$(...)`/backtick command substitution, which
+            # double quotes do NOT suppress) except a literal single quote, which
+            # must itself be escaped by closing the quote, emitting an
+            # escaped/backslashed quote, and reopening the quote: `'` -> `'\''`.
+            # This makes the result safe to splice into a generated `run:` shell
+            # line regardless of the input's content -- defense in depth alongside
+            # (not instead of) the XRD's admission-time pattern validation on
+            # spec.services[].name and spec.services[].build.context
+            # (core/crossplane/xrds/application.yaml).
+            shQuote = lambda s: str -> str {
+                "'" + regex.replace(s, "'", "'\\''") + "'"
+            }
+
+            # =============================================================================
+            # 1. Base resources (always rendered)
+            # =============================================================================
+
+            namespaceObj = k8sObject("namespace", {
+                apiVersion = "v1"
+                kind = "Namespace"
+                metadata.name = appName
+                metadata.labels = {
+                    "app.kubernetes.io/managed-by" = "crossplane"
+                    "platform.digiorg.io/team" = team
+                    "platform.digiorg.io/size" = size
+                    "platform.digiorg.io/type" = "app"
+                }
+            })
+
+            serviceAccountObj = k8sObject("serviceaccount", {
+                apiVersion = "v1"
+                kind = "ServiceAccount"
+                metadata.name = "${appName}-sa"
+                metadata.namespace = appName
+            })
+
+            roleObj = k8sObject("role", {
+                apiVersion = "rbac.authorization.k8s.io/v1"
+                kind = "Role"
+                metadata.name = "${appName}-role"
+                metadata.namespace = appName
+                rules = [
+                    {apiGroups = [""], resources = ["pods", "pods/log"], verbs = ["get", "list", "watch"]}
+                    {apiGroups = [""], resources = ["configmaps"], verbs = ["get", "list"]}
+                    {apiGroups = [""], resources = ["secrets"], verbs = ["get"]}
+                ]
+            })
+
+            roleBindingObj = k8sObject("rolebinding", {
+                apiVersion = "rbac.authorization.k8s.io/v1"
+                kind = "RoleBinding"
+                metadata.name = "${appName}-binding"
+                metadata.namespace = appName
+                roleRef = {apiGroup = "rbac.authorization.k8s.io", kind = "Role", name = "${appName}-role"}
+                subjects = [{kind = "ServiceAccount", name = "${appName}-sa", namespace = appName}]
+            })
+
+            networkPolicyObj = k8sObject("networkpolicy", {
+                apiVersion = "networking.k8s.io/v1"
+                kind = "NetworkPolicy"
+                metadata.name = "${appName}-netpol"
+                metadata.namespace = appName
+                spec = {
+                    podSelector = {}
+                    policyTypes = ["Ingress"]
+                    ingress = [
+                        {from = [{namespaceSelector = {matchLabels = {"kubernetes.io/metadata.name" = "ingress-nginx"}}}]}
+                        {from = [{podSelector = {}}]}
+                    ]
+                }
+            })
+
+            baseItems = [namespaceObj, serviceAccountObj, roleObj, roleBindingObj, networkPolicyObj]
+
+            # =============================================================================
+            # 2. Database (conditional; fails closed on missing CNPG prerequisite)
+            # =============================================================================
+
+            databaseEnabled = xspec.database?.enabled or False
+
+            cnpgRequiredResourcesRequest = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "RequiredResources"
+                requirements = {
+                    cnpgCrd = {
+                        apiVersion = "apiextensions.k8s.io/v1"
+                        kind = "CustomResourceDefinition"
+                        name = "clusters.postgresql.cnpg.io"
+                    }
+                    cnpgWebhook = {
+                        apiVersion = "admissionregistration.k8s.io/v1"
+                        kind = "ValidatingWebhookConfiguration"
+                        name = "cnpg-validating-webhook-configuration"
+                    }
+                }
+            }
+
+            cnpgCrdFound = len(required?.cnpgCrd or []) > 0
+            cnpgWebhookFound = len(required?.cnpgWebhook or []) > 0
+            cnpgReady = cnpgCrdFound and cnpgWebhookFound
+
+            databasePrerequisiteMessage = "spec.database.enabled is true but the CNPG operator/CRD/webhook (clusters.postgresql.cnpg.io) is not confirmed ready. This is a future-infra prerequisite: run \"nu scripts/local-setup.nu future-infra\" (see docs/guides/cnpg-future-app-database.md) and retry. No Cluster has been created."
+
+            databaseCondition = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "Conditions"
+                conditions = [
+                    {
+                        target = "CompositeAndClaim"
+                        force = True
+                        condition = {
+                            type = "DatabaseReady"
+                            status = "True" if cnpgReady else "False"
+                            reason = "Ready" if cnpgReady else "CnpgPrerequisiteNotReady"
+                            message = "CNPG Cluster ${appName}-db provisioned" if cnpgReady else databasePrerequisiteMessage
+                        }
+                    }
+                ]
+            }
+
+            cnpgClusterObj = k8sObject("cnpg-cluster", {
+                apiVersion = "postgresql.cnpg.io/v1"
+                kind = "Cluster"
+                metadata.name = "${appName}-db"
+                metadata.namespace = appName
+                spec = {
+                    instances = sizing.instances
+                    storage = {size = sizing.storage}
+                    bootstrap.initdb = {database = "appdb", owner = "appuser"}
+                    monitoring.enablePodMonitor = False
+                }
+            })
+
+            databaseItems = [cnpgRequiredResourcesRequest, databaseCondition] + ([cnpgClusterObj] if cnpgReady else []) if databaseEnabled else []
+
+            # =============================================================================
+            # 3. Services (iterative -- every entry of spec.services[])
+            # =============================================================================
+
+            services = xspec?.services or []
+
+            # Hoisted ahead of their historical "section 5" position (Gitea/CI/
+            # Harbor) because Issue #285's automatic image promotion needs them
+            # here, before Deployments are built, to decide each buildable
+            # service's promoted image.
+            giteaEnabled = xspec.gitea?.enabled or False
+            giteaVisibility = xspec.gitea?.visibility or "private"
+            giteaCicd = (xspec.gitea?.cicd if xspec.gitea?.cicd != None else True) if giteaEnabled else False
+            buildableServices = [svc for svc in services if (svc.build?.enabled or False)]
+            # Promotion only has a purpose once the CI workflow that pushes
+            # commit-SHA-tagged images actually exists (giteaCicd) and at least
+            # one service opted in (buildableServices non-empty).
+            promotionEnabled = giteaCicd and len(buildableServices) > 0
+
+            serviceReplicas = lambda svc: any -> int {
+                svc.replicas if svc?.replicas else sizing.replicas
+            }
+
+            # =============================================================================
+            # 3b. Automatic immutable image promotion (Issue #285)
+            #
+            # Crossplane, not CI, is the promotion authority: CI (the generated Gitea
+            # Actions workflow, section 5 below) only ever holds a per-project *push*
+            # robot and never an app-config/kubectl credential. This pipeline instead
+            # observes Gitea's main branch HEAD and, per buildable service, whether
+            # Harbor already has an artifact tagged with that exact commit SHA -- only
+            # then does it promote (pin the Deployment's image to that artifact's
+            # immutable sha256 digest, never a mutable tag). A later HEAD commit whose
+            # build hasn't been pushed yet is a routine, expected "pending" state, not
+            # an error: the previously promoted digest (persisted in the XR's own
+            # status by the dxr status patch below) is kept until a newer one is
+            # confirmed. The first build of a service therefore has no Deployment at
+            # all until its first digest resolves -- there is nothing honest to run.
+            # =============================================================================
+
+            isBuildable = lambda svc: any -> bool {
+                svc.build?.enabled or False
+            }
+
+            fortyHexShaPattern = r'^[0-9a-f]{40}$'
+            sha256DigestPattern = r'^sha256:[0-9a-f]{64}$'
+
+            # Issue #285 review finding (malformed-response crash safety): a
+            # Gitea/Harbor endpoint answering HTTP 200 with a body that isn't
+            # valid JSON (an intermediary's HTML error page, a truncated
+            # response) previously reached `json.decode` directly, which
+            # raises a KCL EvaluationError and aborts the *entire* render --
+            # every resource for this AppClaim, not just the one promotion
+            # field, since this Composition is a single KCL program. A
+            # syntactically *valid* but differently-shaped body (a bare JSON
+            # number/string/array instead of an object, or a field of the
+            # wrong type) is just as dangerous: KCL's `?.` only guards a
+            # *missing* key, not a base value of the wrong type --
+            # `parsed?.commit?.id` still raises "invalid value 'int' to load
+            # attribute 'commit'" if `parsed` decoded to e.g. `42`.
+            # `asDict`/`asList`/`asStr` normalize every hop to a safe zero
+            # value instead of raising, and `safeJsonObject` gates the decode
+            # itself behind `json.validate` (kcl-lang.io json system package:
+            # `validate(value: str) -> bool`, confirmed via the pinned
+            # kcl-lang/cli v0.12.7 binary to return `False` rather than raise
+            # for every malformed input tried, including "", non-JSON text,
+            # and truncated JSON).
+            asDict = lambda v: any -> {str:any} {
+                v if typeof(v) == "dict" else {}
+            }
+
+            asList = lambda v: any -> [any] {
+                v if typeof(v) == "list" else []
+            }
+
+            asStr = lambda v: any -> str {
+                v if typeof(v) == "str" else ""
+            }
+
+            safeJsonObject = lambda body: str -> {str:any} {
+                asDict(json.decode(body) if json.validate(body) else None)
+            }
+
+            # `resp` is a provider-http Request's `.status.response` as read via
+            # `ocds` -- `.body` is a raw JSON *string* (provider-http v1.0.14
+            # apis/*/request/v1alpha2/request_types.go `Response.Body string`),
+            # never pre-parsed for KCL, so it must be decoded here. Any failure to
+            # confirm a clean 200 with a well-formed, exact-40-hex commit id (wrong
+            # shape, malformed hex, short hex, non-200, empty/absent response,
+            # malformed/non-object JSON body -- e.g. before the Gitea repo/branch
+            # exists yet, or a misbehaving intermediary) yields "" rather than
+            # raising, so one bad/pending observation never crashes the whole render.
+            extractGiteaHeadSha = lambda resp: any -> str {
+                ok = (resp != None) and (resp?.statusCode == 200) and ((resp?.body or "") != "")
+                parsed = safeJsonObject(resp.body) if ok else {}
+                sha = asStr(asDict(parsed?.commit)?.id)
+                sha if regex.match(sha, fortyHexShaPattern) else ""
+            }
+
+            # Same defensive shape as extractGiteaHeadSha, for Harbor's `GET
+            # .../artifacts/{reference}` response (goharbor/harbor v2.15.1
+            # api/v2.0/swagger.yaml Artifact/Tag definitions): only a clean 200
+            # whose `tags[]` contains the exact expected tag (the commit SHA just
+            # requested -- defense against a stale/cached/mismatched response) and
+            # whose `digest` is a well-formed `sha256:<64 hex>` counts; anything
+            # else (404 build-not-pushed-yet, malformed digest, tag mismatch,
+            # malformed/non-object JSON body, a `tags[]` entry that isn't itself an
+            # object) is "" -- pending, never a fabricated, partially-trusted, or
+            # crash-inducing value.
+            extractHarborDigest = lambda resp: any, expectedTag: str -> str {
+                ok = (resp != None) and (resp?.statusCode == 200) and ((resp?.body or "") != "")
+                parsed = safeJsonObject(resp.body) if ok else {}
+                digest = asStr(parsed?.digest)
+                tags = asList(parsed?.tags)
+                tagNames = [asStr(asDict(t)?.name) for t in tags]
+                tagMatches = expectedTag in tagNames
+                digest if (tagMatches and regex.match(digest, sha256DigestPattern)) else ""
+            }
+
+            # Issue #285 review finding (rotated Harbor CI robot credential
+            # propagation): Harbor's numeric robot `id` (goharbor/harbor
+            # v2.15.1 `Robot` schema) is an observable, non-secret identity
+            # -- distinct from the `id`-adjacent `secret` field, which is
+            # never read here -- that changes exactly when the robot is
+            # deleted and recreated (Harbor auto-increments it; it is never
+            # reused). Same defensive shape as extractGiteaHeadSha/
+            # extractHarborDigest: any failure to confirm a clean 200 with an
+            # integer `id` (non-200, empty/malformed body, wrong-typed field)
+            # yields "" -- a deterministic "not yet resolved" marker used
+            # below, never a crash.
+            extractHarborRobotVersion = lambda resp: any -> str {
+                ok = (resp != None) and (resp?.statusCode == 200) and ((resp?.body or "") != "")
+                parsed = safeJsonObject(resp.body) if ok else {}
+                id = parsed?.id
+                str(id) if typeof(id) == "int" else ""
+            }
+
+            giteaHeadRequestName = "${appName}-gitea-head"
+            giteaHeadUrl = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/branches/main\")"
+
+            # Observe-only Request (no side effect ever needed -- it only ever
+            # reads Gitea's main branch HEAD): the CREATE mapping is a harmless
+            # duplicate of the OBSERVE GET, present purely so provider-http's
+            # requestmapping.GetMapping always resolves a CREATE mapping (the
+            # same idempotency precondition this repo's own
+            # tests/test_provider_http_mapping_contract.py enforces for every
+            # Request) even though isRemovedCheck below guarantees Create() is
+            # never actually invoked. isRemovedCheck/expectedResponseCheck are
+            # CUSTOM constants (never removed / always synced) rather than the
+            # DEFAULT bare-2xx checks: a 404 before the repo/branch exists yet is
+            # a routine, repeated "not yet" state, not a removal -- the DEFAULT
+            # isRemovedCheck (internal/service/request/observe/is_deleted_check.go)
+            # would otherwise treat every such 404 as "removed" and retrigger
+            # Create() (and, once synced once, a later transient failure would
+            # instead fall through to Update(), which -- like Create() -- has no
+            # real mapping to resolve either). This pipeline decides what "not
+            # yet resolved" means itself (an exact 40-hex commit id --
+            # extractGiteaHeadSha above), not this Request's own Ready/Synced
+            # condition.
+            giteaHeadRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = giteaHeadRequestName
+                metadata.annotations = annotationFor("gitea-head")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["token {{ crossplane-gitea-credentials:crossplane-system:token }}"]
+                        }
+                        payload.baseUrl = giteaApiBase
+                        mappings = [
+                            {method = "GET", action = "CREATE", url = giteaHeadUrl}
+                            {method = "GET", action = "OBSERVE", url = giteaHeadUrl}
+                        ]
+                        isRemovedCheck = {type = "CUSTOM", logic = "false"}
+                        expectedResponseCheck = {type = "CUSTOM", logic = "true"}
+                    }
+                }
+            }
+
+            # Issue #285 review finding: function-kcl's `ocds` map is keyed by
+            # each composed resource's `krm.kcl.dev/composition-resource-name`
+            # annotation value (the `slug` passed to annotationFor/resourceName
+            # above), never by its `metadata.name` -- `giteaHeadRequestName`
+            # ("${appName}-gitea-head") is the latter, so it can never match
+            # an actual ocds entry. The resource-name slug for this Request is
+            # plain "gitea-head" (see annotationFor("gitea-head") above).
+            giteaHeadResponse = ocds["gitea-head"]?.Resource?.status?.response
+            giteaHeadSha = extractGiteaHeadSha(giteaHeadResponse) if promotionEnabled else ""
+
+            # Same observe-only shape/reasoning as giteaHeadRequest, per buildable
+            # service, against the exact commit-SHA tag the CI workflow (section 5)
+            # pushes to (`<harborRegistry>/<appName>/<service name>:<gitea.sha>`).
+            # Harbor's `GET /projects/{project}/repositories/{repository}
+            # /artifacts/{reference}` (goharbor/harbor v2.15.1
+            # src/server/v2.0/handler/artifact.go GetArtifact) requires
+            # `{Resource: artifact, Action: read}` -- granted to the
+            # crossplane-system bootstrap robot (core/crossplane/bootstrap/harbor-
+            # robot-request.yaml), the identity used here via the same
+            # `crossplane-harbor-credentials` secret the harborProjectRequest/
+            # harborRobotRequest below already use, since this is a
+            # control-plane promotion decision, not a per-app credential.
+            harborArtifactRequestFor = lambda svc: any, tag: str -> any {
+                url = "(.payload.baseUrl + \"/projects/${appName}/repositories/${svc.name}/artifacts/${tag}\")"
+                {
+                    apiVersion = "http.crossplane.io/v1alpha2"
+                    kind = "Request"
+                    metadata.name = "${appName}-harbor-artifact-${svc.name}"
+                    metadata.annotations = annotationFor("harbor-artifact-${svc.name}")
+                    spec = {
+                        deletionPolicy = "Orphan"
+                        providerConfigRef.name = "default"
+                        forProvider = {
+                            headers = {
+                                "Content-Type" = ["application/json"]
+                                "Authorization" = ["Basic {{ crossplane-harbor-credentials:crossplane-system:basicAuth }}"]
+                            }
+                            payload.baseUrl = harborApiBase
+                            mappings = [
+                                {method = "GET", action = "CREATE", url = url}
+                                {method = "GET", action = "OBSERVE", url = url}
+                            ]
+                            isRemovedCheck = {type = "CUSTOM", logic = "false"}
+                            expectedResponseCheck = {type = "CUSTOM", logic = "true"}
+                        }
+                    }
+                }
+            }
+
+            # Issue #285 (previous digest preservation): `oxr` is the *observed*
+            # composite -- i.e. this XR's own status as Crossplane persisted it on
+            # the *previous* reconcile (the dxr status patch below is what wrote
+            # it). Reading it back is what lets a pending/stale/failed Harbor
+            # observation this reconcile (extractHarborDigest returning "") fall
+            # back to the last confirmed-good digest instead of ever going blank.
+            previousServiceStatus = lambda name: str -> any {
+                prevList = oxr.status?.services or []
+                matches = [s for s in prevList if s?.name == name]
+                matches[0] if len(matches) > 0 else None
+            }
+
+            resolvedPromotionFor = lambda svc: any -> any {
+                eligible = promotionEnabled and isBuildable(svc)
+                # Same resource-name-not-metadata-name key as giteaHeadResponse
+                # above -- the composition-resource-name slug for this Request
+                # is "harbor-artifact-${svc.name}" (see
+                # harborArtifactRequestFor's annotationFor call), not prefixed
+                # with appName.
+                artifactResp = ocds["harbor-artifact-${svc.name}"]?.Resource?.status?.response
+                freshDigest = extractHarborDigest(artifactResp, giteaHeadSha) if (eligible and giteaHeadSha != "") else ""
+                prev = previousServiceStatus(svc.name) if eligible else None
+                {
+                    digest = freshDigest if freshDigest != "" else (prev?.digest or "")
+                    headSha = giteaHeadSha if freshDigest != "" else (prev?.headSha or "")
+                }
+            }
+
+            imageRefFor = lambda svc: any -> str {
+                promo = resolvedPromotionFor(svc)
+                "${harborRegistry}/${appName}/${svc.name}@${promo.digest}" if (isBuildable(svc) and promo.digest != "") else svc.image
+            }
+
+            # Issue #285 (private pull, push/pull separation): a *separate*,
+            # pull-only Harbor robot -- never the push-capable CI robot
+            # (harborRobotRequest below) -- backs the Deployment's
+            # imagePullSecrets, so a compromised/leaked workload pull credential
+            # can never push. Its dockerconfigjson Secret must be pre-created
+            # with `type: kubernetes.io/dockerconfigjson` by a provider-kubernetes
+            # Object (pullSecretShellObj below) because provider-http's
+            # secretInjectionConfigs (apis/common/secrets_injections.go
+            # SecretInjectionConfig) has no field to set a Secret's `type` -- its
+            # own GetOrCreateSecret fallback (internal/kube-handler/client.go)
+            # would otherwise create a plain Opaque Secret.
+            pullSecretName = "${appName}-harbor-pull"
+            # `kubernetes.io/dockerconfigjson` Secret validation (k8s
+            # pkg/apis/core/validation/validation.go ValidateSecret) requires the
+            # `.dockerconfigjson` key to exist and be well-formed JSON at CREATE
+            # time -- this placeholder satisfies that; the real credential is
+            # patched in below (pullRobotRequest secretInjectionConfigs) once the
+            # pull robot exists.
+            pullSecretPlaceholder = base64.encode(json.encode({auths = {}}))
+
+            # managementPolicies: ["Create", "Observe"] (crossplane-runtime v2
+            # apis/common/v1/resource.go ResourceSpec.ManagementPolicies, honored
+            # generically by every provider built on it, including provider-
+            # kubernetes v1.2.1) -- deliberately omits "Update": this Object must
+            # create the Secret shell exactly once and never touch it again, or
+            # every reconcile would overwrite pullRobotRequest's real patched
+            # `.dockerconfigjson` value back to the empty placeholder.
+            pullSecretShellObj = {
+                apiVersion = "kubernetes.crossplane.io/v1alpha2"
+                kind = "Object"
+                metadata.name = resourceName("harbor-pull-secret")
+                metadata.annotations = annotationFor("harbor-pull-secret")
+                spec = {
+                    managementPolicies = ["Create", "Observe"]
+                    providerConfigRef.name = "default"
+                    forProvider.manifest = {
+                        apiVersion = "v1"
+                        kind = "Secret"
+                        type = "kubernetes.io/dockerconfigjson"
+                        metadata.name = pullSecretName
+                        metadata.namespace = appName
+                        data = {".dockerconfigjson" = pullSecretPlaceholder}
+                    }
+                }
+            }
+
+            # Issue #285 review finding (typed pull Secret creation/injection
+            # race): pullRobotRequest's secretInjectionConfigs below assumes
+            # the Secret pullSecretShellObj creates already exists with the
+            # correct `type` -- but Crossplane reconciles every composed
+            # resource of an XR independently and concurrently, so nothing in
+            # this `items` list's *order* controls which provider's
+            # controller actually creates the Secret first. If provider-http
+            # ever reconciled pullRobotRequest before provider-kubernetes had
+            # created the typed Secret, provider-http's own
+            # GetOrCreateSecret fallback would create it first as a plain
+            # Opaque Secret (no `type`) -- and since `Secret.type` is
+            # immutable in the Kubernetes API, pullSecretShellObj's own later
+            # CREATE would then collide (409) and, since "Update" is
+            # deliberately excluded from its managementPolicies above (so it
+            # never fights provider-http's later credential patch), the
+            # Secret would be stuck as the wrong type forever. The fix
+            # sequences the two controllers across reconciles instead of
+            # within one: pullRobotRequest only renders once
+            # `ocds["harbor-pull-secret"]` -- the composition-resource-name
+            # slug (annotationFor("harbor-pull-secret") above), never the
+            # Object's Kubernetes `metadata.name` (same not-metadata-name
+            # caveat as giteaHeadResponse/resolvedPromotionFor above) --
+            # reports a `Ready: "True"` condition, i.e. provider-kubernetes
+            # itself has already confirmed the typed Secret exists. Until
+            # then, only the shell Object renders (which must always exist
+            # unconditionally -- there is nothing to observe the readiness of
+            # otherwise).
+            # Reuses the same asDict/asList crash-safety helpers as
+            # extractGiteaHeadSha/extractHarborDigest above -- a Kubernetes
+            # managed resource's `.status` is a well-typed API field and
+            # should never actually be malformed, but this check gates a
+            # correctness-critical race fix, so it fails closed (treated as
+            # "not ready yet") rather than raising if it somehow ever is.
+            isReadyConditionTrue = lambda ocdEntry: any -> bool {
+                status = asDict(asDict(ocdEntry)?.Resource)?.status
+                conditions = asList(asDict(status)?.conditions)
+                matches = [c for c in conditions if asStr(asDict(c)?.type) == "Ready" and asStr(asDict(c)?.status) == "True"]
+                len(matches) > 0
+            }
+
+            pullSecretShellReady = isReadyConditionTrue(ocds["harbor-pull-secret"])
+
+            # Issue #285 review finding (CRITICAL): raw robot `name`/`secret`
+            # land here first -- an intermediate, Opaque Secret only the sync
+            # Job (below) ever reads -- never directly into the typed
+            # dockerconfigjson Secret. See the full rationale on
+            # pullRobotRequest's secretInjectionConfigs below.
+            pullRawSecretName = "${appName}-harbor-pull-raw"
+
+            # Crash-safe identity: same ID-based OBSERVE + CUSTOM isRemovedCheck/
+            # expectedResponseCheck shape as harborRobotRequest below (see its
+            # comments for the full Harbor ListRobot/unique_robot rationale),
+            # scoped to `repository: pull` only -- no `push`.
+            pullRobotRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = "${appName}-harbor-pull-robot"
+                metadata.annotations = annotationFor("harbor-pull-robot")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["Basic {{ crossplane-harbor-credentials:crossplane-system:basicAuth }}"]
+                        }
+                        payload = {
+                            baseUrl = harborApiBase
+                            body = json.encode({
+                                name = "${appName}-pull"
+                                duration = -1
+                                level = "project"
+                                permissions = [
+                                    {
+                                        kind = "project"
+                                        namespace = appName
+                                        access = [{resource = "repository", action = "pull"}]
+                                    }
+                                ]
+                            })
+                        }
+                        mappings = [
+                            {method = "POST", action = "CREATE", url = "(.payload.baseUrl + \"/robots\")", body = ".payload.body"}
+                            {
+                                method = "GET"
+                                action = "OBSERVE"
+                                url = "(.payload.baseUrl + \"/robots/\" + (.response.body.id | tostring))"
+                            }
+                        ]
+                        isRemovedCheck = {
+                            type = "CUSTOM"
+                            logic = ".response.statusCode == 404"
+                        }
+                        # Issue #285 review finding (HIGH -- CI/pull robot
+                        # identity check redacted before evaluation):
+                        # ApplyResponseDataToSecrets (internal/service/request/
+                        # observe.go IsUpToDate) runs -- and mutates the very
+                        # same `details.HttpResponse` -- *before*
+                        # determineIfUpToDate evaluates expectedResponseCheck,
+                        # for every OBSERVE. A keyMapping reading `.body.name`
+                        # (below) makes provider-http's own
+                        # replaceSensitiveValues (internal/data-patcher/
+                        # secret_patcher.go) overwrite `.body.name` in that
+                        # same response with a `{{secret:ns:key}}` placeholder
+                        # first. A check depending on `r.name` would therefore
+                        # never match the real name again -- permanently
+                        # "not synced", with no UPDATE mapping to converge via
+                        # either. `level`/`namespace`/`permissions` are never
+                        # fed to any keyMapping here, so they are never
+                        # redacted -- and, combined with the ID-based GET
+                        # already pinning identity, are already sufficient on
+                        # their own (a Harbor project's `namespace` already
+                        # uniquely determines which app's robot this is).
+                        expectedResponseCheck = {
+                            type = "CUSTOM"
+                            logic = "def isPullRobot(r): r.level == \"project\" and (r.permissions // [] | length) == 1 and (r.permissions[0].kind == \"project\") and (r.permissions[0].namespace == \"${appName}\") and ((r.permissions[0].access // []) | length) == 1 and ((r.permissions[0].access // []) | any(.resource==\"repository\" and .action==\"pull\")); (.response.statusCode == 200) and isPullRobot(.response.body)"
+                        }
+                        # Issue #285 review finding (CRITICAL -- pull credential
+                        # redaction/overwrite): the previous design used a single
+                        # keyMapping whose responseJQ *constructed* the full
+                        # `{auths: {...}}` dockerconfigjson blob directly from
+                        # `.body.name`/`.body.secret`. Two independent defects
+                        # follow from provider-http v1.0.14's own implementation
+                        # (internal/data-patcher/{patch,secret_patcher}.go,
+                        # verified against the pinned release source):
+                        #
+                        #  1. `replaceSensitiveValues` only ever redacts the
+                        #     literal `valueToPatch` it just extracted -- here,
+                        #     the *whole* constructed JSON blob -- by searching
+                        #     for that exact string in the raw response body.
+                        #     The real upstream Harbor response only ever
+                        #     contains the raw `name`/`secret` fields, never
+                        #     that constructed blob, so nothing is ever found
+                        #     to redact: the raw `.body.secret` value survives,
+                        #     unredacted, in `.status.response.body` on this
+                        #     Request CR itself.
+                        #  2. `updateSecretData` only applies
+                        #     `missingFieldStrategy` when the *whole* extracted
+                        #     value is nil. jq's `.body.secret` on a response
+                        #     that omits `secret` (true of every OBSERVE after
+                        #     CREATE -- see harborRobotRequest below) evaluates
+                        #     to `null`, not absent, so the surrounding
+                        #     `{auths: {...password: null...}}` object still
+                        #     parses and marshals successfully via `tojson` --
+                        #     a *non-nil* value that unconditionally overwrites
+                        #     the Secret with a broken, password-null
+                        #     dockerconfigjson on every single OBSERVE,
+                        #     `missingFieldStrategy: preserve` notwithstanding.
+                        #
+                        # The fix: only ever extract raw, single fields here
+                        # (exactly like harborRobotRequest below) into an
+                        # intermediate Opaque Secret -- each mapping's
+                        # `valueToPatch` is then either the literal field value
+                        # (which `replaceSensitiveValues` finds verbatim in the
+                        # raw response body and genuinely redacts) or nil
+                        # (which `preserve` genuinely leaves untouched,
+                        # per-field, independent of the other field). The
+                        # typed, final `kubernetes.io/dockerconfigjson` Secret
+                        # Deployments actually consume is built entirely
+                        # *outside* provider-http's response transformation, by
+                        # a dedicated, least-privilege Job (pullSecretSyncJobObj
+                        # below) -- provider-http itself never sees or
+                        # constructs that blob.
+                        secretInjectionConfigs = [
+                            {
+                                secretRef = {name = pullRawSecretName, namespace = appName}
+                                keyMappings = [
+                                    {secretKey = "name", responseJQ = ".body.name", missingFieldStrategy = "preserve"}
+                                    {secretKey = "secret", responseJQ = ".body.secret", missingFieldStrategy = "preserve"}
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+
+            # Non-secret identity marker for the pull robot (see
+            # extractHarborRobotVersion/harborRobotVersion above -- identical
+            # shape, reused verbatim): changes exactly when the pull robot is
+            # deleted/recreated, never reused (Harbor auto-increments `id`).
+            # Used below purely to key the sync Job's name so a rotation
+            # forces a genuinely fresh Job (and thus a fresh Pod that reads
+            # the freshly-rotated raw credential) rather than silently
+            # reusing a completed Job's stale result (a Kubernetes Job's
+            # `spec.template` is immutable once created -- it can never be
+            # made to simply "run again").
+            pullRobotResponse = ocds["harbor-pull-robot"]?.Resource?.status?.response
+            pullRobotVersion = extractHarborRobotVersion(pullRobotResponse) if pullSecretShellReady else ""
+
+            pullSecretSyncName = "${appName}-pull-secret-sync"
+
+            pullSecretSyncSaObj = k8sObject("harbor-pull-secret-sync-sa", {
+                apiVersion = "v1"
+                kind = "ServiceAccount"
+                metadata.name = pullSecretSyncName
+                metadata.namespace = appName
+            })
+
+            # Least privilege: `get`/`patch` -- exactly what
+            # `kubectl apply` issues here (a GET to compute the patch against
+            # the existing object, then a PATCH; `create` is deliberately
+            # omitted, since pullSecretShellObj above always creates the
+            # destination Secret first) -- on exactly the one named Secret
+            # this Job ever touches. Nothing cluster-scoped, nothing
+            # wildcarded (standard Kubernetes RBAC `resourceNames` scoping,
+            # rbac.authorization.k8s.io/v1 PolicyRule). Stable across
+            # rotations (unlike the Job itself below) -- its content never
+            # changes, so there's no reason to churn it.
+            pullSecretSyncRoleObj = k8sObject("harbor-pull-secret-sync-role", {
+                apiVersion = "rbac.authorization.k8s.io/v1"
+                kind = "Role"
+                metadata.name = pullSecretSyncName
+                metadata.namespace = appName
+                rules = [
+                    {
+                        apiGroups = [""]
+                        resources = ["secrets"]
+                        resourceNames = [pullSecretName]
+                        verbs = ["get", "patch"]
+                    }
+                ]
+            })
+
+            pullSecretSyncRoleBindingObj = k8sObject("harbor-pull-secret-sync-rolebinding", {
+                apiVersion = "rbac.authorization.k8s.io/v1"
+                kind = "RoleBinding"
+                metadata.name = pullSecretSyncName
+                metadata.namespace = appName
+                roleRef = {apiGroup = "rbac.authorization.k8s.io", kind = "Role", name = pullSecretSyncName}
+                subjects = [{kind = "ServiceAccount", name = pullSecretSyncName, namespace = appName}]
+            })
+
+            # alpine/k8s:1.36.1 -- matches the pinned KinD node image's
+            # Kubernetes minor version exactly (scripts/local-setup.nu
+            # KIND_NODE_IMAGE = kindest/node:v1.36.1). Deliberately *not*
+            # rancher/kubectl (that image is `FROM scratch` -- confirmed via
+            # its published OCI config, `org.opencontainers.image.
+            # description: "kubectl from scratch"` -- containing only the
+            # `kubectl` binary itself, no shell at all, so `/bin/sh -c`
+            # below would fail to exec). alpine/k8s is confirmed (via its own
+            # published OCI config `history`) built `FROM` a genuine Alpine
+            # minirootfs with `apk add` on top, so the real BusyBox `/bin/sh`
+            # (ash), `sed`, and `base64` this script needs are all present --
+            # unlike the ash-only `${var//search/replace}` extension, this
+            # script deliberately avoids relying on any BusyBox-specific
+            # behavior beyond that baseline. Like every other Job image
+            # already used in this platform (curlimages/curl in
+            # core/platform/base/{harbor,opensearch}), pinned to an
+            # immutable digest -- verified 2026-07-23 against the image's
+            # real manifest-list digest via the registry v2 API
+            # (registry-1.docker.io/v2/alpine/k8s/manifests/1.36.1). kubectl
+            # running inside a Pod with no kubeconfig present falls back to
+            # in-cluster config (client-go's
+            # clientcmd.DeferredLoadingClientConfig -> rest.InClusterConfig),
+            # authenticating as this Job's own least-privilege ServiceAccount
+            # token -- no separate kubeconfig Secret is needed.
+            pullSecretSyncImage = "alpine/k8s:1.36.1@sha256:692239d739589247c4a791205ed9619c28ae85a21286e19a6211c04a62c56668"
+
+            # Builds the typed dockerconfigjson entirely with `sh`/`printf`
+            # builtins, `sed`, and `base64` -- no `jq`, no templating engine,
+            # nothing that could echo the credential anywhere.
+            # `NAME`/`SECRET` are read from files (a Secret volume mount,
+            # populated by kubelet -- never this Job's own argv or
+            # environment), and the finished Secret manifest is piped to
+            # `kubectl apply -f -` over stdin, so the credential is never a
+            # command-line argument (never visible via `ps`/`kubectl
+            # describe pod`) and is never `echo`'d/`set -x`'d into the Job's
+            # own logs. `REGISTRY`/`SECRET_NAME`/`NAMESPACE` are plain,
+            # non-secret values injected via the container's `env` (below),
+            # so this script body needs zero KCL string interpolation and is
+            # written as a raw string (`r"""..."""`, confirmed to leave
+            # `${...}` shell syntax completely untouched by KCL) -- the same
+            # reasoning shQuote/buildJobFor above apply to CI's shell,
+            # applied here to the sync Job's shell instead.
+            # (No heredoc: `kubectl apply -f -` accepts JSON as readily as
+            # YAML, and building the whole manifest via a single `printf`
+            # sidesteps heredoc-terminator/indentation pitfalls entirely --
+            # every field is still an explicit `printf` *argument*, never
+            # part of the format string itself, so no field's content is
+            # ever interpreted as a `printf` conversion specifier.)
+            pullSecretSyncScript = r"""set -eu
+            for tool in base64 sed; do
+              command -v "$tool" >/dev/null 2>&1 || { printf '%s not found\n' "$tool" >&2; exit 1; }
+            done
+            NAME=$(cat /var/run/secrets/harbor-pull-raw/name)
+            SECRET=$(cat /var/run/secrets/harbor-pull-raw/secret)
+            # Minimal JSON-string escaping (backslash, then double-quote) --
+            # Harbor generates both NAME and SECRET itself from a fixed,
+            # safe charset, but this stays correct even if that ever
+            # changes. Plain POSIX `sed` (not `${var//search/replace}`,
+            # a bash/ash-only extension this image's actual `/bin/sh` is
+            # not guaranteed to support) for portability.
+            esc() {
+              printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+            }
+            AUTH=$(printf '%s:%s' "$NAME" "$SECRET" | base64 | tr -d '\n')
+            NAME_ESC=$(esc "$NAME")
+            SECRET_ESC=$(esc "$SECRET")
+            DOCKERCFG=$(printf '{"auths":{"%s":{"username":"%s","password":"%s","auth":"%s"}}}' "$REGISTRY" "$NAME_ESC" "$SECRET_ESC" "$AUTH")
+            DOCKERCFG_B64=$(printf '%s' "$DOCKERCFG" | base64 | tr -d '\n')
+            MANIFEST_ESC=$(esc "$SECRET_NAME")
+            MANIFEST=$(printf '{"apiVersion":"v1","kind":"Secret","metadata":{"name":"%s","namespace":"%s"},"type":"kubernetes.io/dockerconfigjson","data":{".dockerconfigjson":"%s"}}' "$MANIFEST_ESC" "$NAMESPACE" "$DOCKERCFG_B64")
+            printf '%s' "$MANIFEST" | kubectl apply -f -
+            printf 'harbor pull secret synced\n'
+            """
+
+            # Keyed by the non-secret pullRobotVersion (never the credential
+            # itself): a rotation renders a new Job name here, which
+            # Crossplane (via function-kcl's composition-resource-name
+            # matching) treats as an entirely new composed resource -- the
+            # *previous* Job's Object falls out of the desired `items` list
+            # and is garbage-collected (the `k8sObject` helper never sets
+            # `deletionPolicy`, so it defaults to "Delete"), which cascades
+            # to deleting the stale Job/Pod too. This is what makes rotation
+            # deterministic: a completed Job never silently "reruns" with a
+            # fresh credential, so it's the fresh *identity* that forces the
+            # fresh Pod that reads the freshly rotated raw Secret.
+            pullSecretSyncJobObj = k8sObject("harbor-pull-secret-sync-${pullRobotVersion}", {
+                apiVersion = "batch/v1"
+                kind = "Job"
+                metadata.name = "${pullSecretSyncName}-${pullRobotVersion}"
+                metadata.namespace = appName
+                spec = {
+                    backoffLimit = 3
+                    # Keep the completed, robot-versioned Job while it remains
+                    # desired. A TTL would delete the external Job while its
+                    # provider-kubernetes Object remains desired, causing the
+                    # provider to recreate and rerun it forever. Rotation
+                    # changes pullRobotVersion, so Crossplane GC still replaces
+                    # this completed Job with exactly one fresh version.
+                    template = {
+                        spec = {
+                            serviceAccountName = pullSecretSyncName
+                            restartPolicy = "OnFailure"
+                            automountServiceAccountToken = True
+                            containers = [
+                                {
+                                    name = "sync-pull-secret"
+                                    image = pullSecretSyncImage
+                                    command = ["/bin/sh", "-c", pullSecretSyncScript]
+                                    env = [
+                                        {name = "REGISTRY", value = harborRegistry}
+                                        {name = "SECRET_NAME", value = pullSecretName}
+                                        {name = "NAMESPACE", value = appName}
+                                    ]
+                                    volumeMounts = [
+                                        {name = "harbor-pull-raw", mountPath = "/var/run/secrets/harbor-pull-raw", readOnly = True}
+                                    ]
+                                }
+                            ]
+                            volumes = [
+                                {
+                                    name = "harbor-pull-raw"
+                                    secret = {
+                                        secretName = pullRawSecretName
+                                        items = [
+                                            {key = "name", path = "name"}
+                                            {key = "secret", path = "secret"}
+                                        ]
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            })
+
+            pullSecretSyncItems = [pullSecretSyncSaObj, pullSecretSyncRoleObj, pullSecretSyncRoleBindingObj, pullSecretSyncJobObj] if pullRobotVersion != "" else []
+
+            # Observe-only (never Create/Update -- pullSecretShellObj/the
+            # sync Job above own the Secret's lifecycle): independently
+            # verifies, from the Secret's own live content, that the *real*
+            # credential has actually landed -- never just that the sync Job
+            # reported success. `readiness.policy: DeriveFromCelQuery` is a
+            # real, non-experimental provider-kubernetes v1.2.1 feature
+            # (apis/cluster/object/v1alpha2/types.go ReadinessPolicy,
+            # internal/controller/cluster/object/object.go
+            # checkDeriveFromCelQuery, verified against the pinned release
+            # source) -- `object` is bound to the observed external resource
+            # exactly as `kubectl get -o json` would show it, so
+            # `object.data[".dockerconfigjson"]` is the Secret's real,
+            # still-base64-encoded value, comparable directly against the
+            # known placeholder without decoding anything. The platform's
+            # pinned provider-kubernetes v1.2.1 runtime MUST set
+            # SANITIZE_SECRETS=true (core/crossplane/providers/packages/
+            # provider-kubernetes.yaml); otherwise provider-kubernetes would
+            # copy this live Secret's data into Object status.atProvider.
+            pullSecretObservedObj = {
+                apiVersion = "kubernetes.crossplane.io/v1alpha2"
+                kind = "Object"
+                metadata.name = resourceName("harbor-pull-secret-observed")
+                metadata.annotations = annotationFor("harbor-pull-secret-observed")
+                spec = {
+                    managementPolicies = ["Observe"]
+                    providerConfigRef.name = "default"
+                    forProvider.manifest = {
+                        apiVersion = "v1"
+                        kind = "Secret"
+                        metadata.name = pullSecretName
+                        metadata.namespace = appName
+                    }
+                    readiness = {
+                        policy = "DeriveFromCelQuery"
+                        celQuery = "has(object.data) && (\".dockerconfigjson\" in object.data) && object.data[\".dockerconfigjson\"] != \"${pullSecretPlaceholder}\""
+                    }
+                }
+            }
+
+            pullSecretObservedItems = [pullSecretObservedObj] if pullSecretShellReady else []
+
+            # Gates every buildable service's Deployment (imagePullSecrets)
+            # on the *observed* real credential, not merely on the sync Job
+            # having been scheduled -- a Deployment referencing the Secret
+            # while it still holds the `{auths:{}}` placeholder would
+            # ImagePullBackOff against Harbor's private registry.
+            pullCredentialReady = isReadyConditionTrue(ocds["harbor-pull-secret-observed"]) if promotionEnabled else False
+
+            deploymentFor = lambda svc: any -> any {
+                k8sObject("service-${svc.name}-deployment", {
+                    apiVersion = "apps/v1"
+                    kind = "Deployment"
+                    metadata.name = svc.name
+                    metadata.namespace = appName
+                    spec = {
+                        replicas = serviceReplicas(svc)
+                        selector.matchLabels = {app = svc.name}
+                        template = {
+                            metadata.labels = {app = svc.name, "platform.digiorg.io/app" = appName}
+                            spec = {
+                                serviceAccountName = "${appName}-sa"
+                                **({"imagePullSecrets": [{"name": pullSecretName}]} if isBuildable(svc) else {})
+                                containers = [
+                                    {
+                                        name = "app"
+                                        image = imageRefFor(svc)
+                                        ports = [{containerPort = svc.port}]
+                                        resources = {
+                                            requests = {cpu = sizing.cpuRequest, memory = sizing.memRequest}
+                                            limits = {cpu = sizing.cpuLimit, memory = sizing.memLimit}
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                })
+            }
+
+            serviceObjFor = lambda svc: any -> any {
+                k8sObject("service-${svc.name}-svc", {
+                    apiVersion = "v1"
+                    kind = "Service"
+                    metadata.name = "${svc.name}-svc"
+                    metadata.namespace = appName
+                    spec = {
+                        selector = {app = svc.name}
+                        ports = [{port = 80, targetPort = svc.port}]
+                        type = "ClusterIP"
+                    }
+                })
+            }
+
+            ingressFor = lambda svc: any -> any {
+                k8sObject("service-${svc.name}-ingress", {
+                    apiVersion = "networking.k8s.io/v1"
+                    kind = "Ingress"
+                    metadata.name = "${svc.name}-ingress"
+                    metadata.namespace = appName
+                    metadata.annotations = {"nginx.ingress.kubernetes.io/rewrite-target" = "/"}
+                    spec = {
+                        ingressClassName = "nginx"
+                        rules = [
+                            {
+                                host = "${appName}-${svc.name}.digiorg.local"
+                                http.paths = [
+                                    {
+                                        path = "/"
+                                        pathType = "Prefix"
+                                        backend.service = {name = "${svc.name}-svc", port.number = 80}
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                })
+            }
+
+            # Issue #285: a buildable service with no promoted digest yet (first
+            # build still pending) gets no Deployment at all -- there is no
+            # honest image to run. Service/Ingress still render regardless (they
+            # don't reference the image), so they're ready the instant the first
+            # digest resolves.
+            # Issue #285 review finding (CRITICAL): a buildable service also
+            # needs the *real* pull credential actually applied
+            # (pullCredentialReady, defined above) before its Deployment
+            # renders -- not just a resolved digest -- or the Pod would
+            # reference a Secret still holding the empty `{auths:{}}`
+            # placeholder and ImagePullBackOff against Harbor's private
+            # registry.
+            deployableServices = [svc for svc in services if (not isBuildable(svc)) or (resolvedPromotionFor(svc).digest != "" and pullCredentialReady)]
+
+            serviceItems = [deploymentFor(svc) for svc in deployableServices] + [serviceObjFor(svc) for svc in services] + [ingressFor(svc) for svc in services]
+
+            # =============================================================================
+            # 4. Messaging (conditional; iterative over every subject)
+            # =============================================================================
+
+            messagingEnabled = xspec.messaging?.enabled or False
+            subjects = xspec.messaging?.subjects or []
+
+            # Issue #285 runtime blocker (JetStream subject collision):
+            # sanitizeSubject only preserves lowercase [a-z0-9] (collapsing
+            # everything else, including uppercase letters and any
+            # separator, to a single "-"), so two distinct, XRD-accepted
+            # subjects that differ only by case or by using "." vs "-" as a
+            # separator (e.g. "myapp.events" and "myapp-events") sanitize to
+            # the identical string. Keying the Stream's Kubernetes object
+            # name and its spec.name/spec.streamName NATS identifiers off
+            # that value would collide two unrelated subjects onto one
+            # Stream, silently dropping one. Index-based naming (idx is
+            # already unique per subjects[] entry -- the same index already
+            # used for the "messaging-stream-${idx}" composition-resource
+            # name) can never collide, regardless of subject content.
+            streamNameFor = lambda idx: int -> str {
+                "${appName}-messaging-${idx}"
+            }
+
+            streamFor = lambda subject: str, idx: int -> any {
+                streamName = streamNameFor(idx)
+                k8sObject("messaging-stream-${idx}", {
+                    apiVersion = "jetstream.nats.io/v1beta2"
+                    kind = "Stream"
+                    metadata.name = streamName
+                    metadata.namespace = appName
+                    spec = {
+                        name = streamName
+                        subjects = [subject]
+                        storage = "file"
+                        replicas = 1
+                        retention = "limits"
+                        maxAge = "168h"
+                    }
+                })
+            }
+
+            consumerFor = lambda subject: str, idx: int -> any {
+                streamName = streamNameFor(idx)
+                k8sObject("messaging-consumer-${idx}", {
+                    apiVersion = "jetstream.nats.io/v1beta2"
+                    kind = "Consumer"
+                    metadata.name = "${streamName}-consumer"
+                    metadata.namespace = appName
+                    spec = {
+                        streamName = streamName
+                        durableName = "${streamName}-consumer"
+                        filterSubject = subject
+                        ackPolicy = "explicit"
+                        deliverPolicy = "all"
+                    }
+                })
+            }
+
+            natsConfigObj = k8sObject("messaging-config", {
+                apiVersion = "v1"
+                kind = "ConfigMap"
+                metadata.name = "${appName}-nats-config"
+                metadata.namespace = appName
+                metadata.labels = {"app.kubernetes.io/managed-by" = "crossplane", "platform.digiorg.io/component" = "messaging", "platform.digiorg.io/app" = appName}
+                data = {
+                    NATS_URL = "nats://nats.messaging.svc.cluster.local:4222"
+                    NATS_SUBJECTS = ",".join(subjects)
+                }
+            })
+
+            messagingItems = ([natsConfigObj] + [streamFor(subjects[i], i) for i in range(len(subjects))] + [consumerFor(subjects[i], i) for i in range(len(subjects))]) if (messagingEnabled and len(subjects) > 0) else []
+
+            # =============================================================================
+            # 5. Gitea source repository (conditional) + CI/CD (conditional on gitea.cicd)
+            #    + Harbor project/robot (conditional on gitea.enabled and gitea.cicd)
+            # =============================================================================
+            # giteaEnabled/giteaVisibility/giteaCicd/buildableServices are defined
+            # in section 3 above (Issue #285 image promotion needs them earlier).
+
+            giteaRepoRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = "${appName}-gitea-repo"
+                metadata.annotations = annotationFor("gitea-repo")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["token {{ crossplane-gitea-credentials:crossplane-system:token }}"]
+                        }
+                        payload = {
+                            baseUrl = giteaApiBase
+                            # provider-http's Payload.Body (and Mapping.Body) are plain
+                            # strings: the controller JSON-decodes payload.body internally
+                            # before jq evaluates ".payload.body.<field>" against it, so
+                            # this must be a JSON-encoded string, not a nested KCL map.
+                            body = json.encode({
+                                name = appName
+                                description = "Source repository for ${appName} (team: ${team}), managed by Crossplane AppClaim"
+                                private = giteaVisibility == "private"
+                                auto_init = True
+                                default_branch = "main"
+                            })
+                        }
+                        mappings = [
+                            {method = "POST", action = "CREATE", url = "(.payload.baseUrl + \"/orgs/DigiOrg/repos\")", body = ".payload.body"}
+                            {method = "GET", action = "OBSERVE", url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}\")"}
+                            # Runtime blocker (Gitea drift): repairs the repository's
+                            # visibility if it drifts from spec.gitea.visibility (e.g. an
+                            # operator flips it directly in Gitea). `PATCH
+                            # /repos/{owner}/{repo}` (`EditRepoOption.private`) is Gitea
+                            # 1.26.1's repo-edit endpoint (confirmed against
+                            # templates/swagger/v1_json.tmpl tag v1.26.1).
+                            {
+                                method = "PATCH"
+                                action = "UPDATE"
+                                url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}\")"
+                                body = "{private: .payload.body.private}"
+                            }
+                        ]
+                        # CUSTOM (not DEFAULT): compares the observed repo's `private`
+                        # field against the desired value directly, rather than trusting
+                        # a bare 2xx GET response as "synced" regardless of drift.
+                        expectedResponseCheck = {
+                            type = "CUSTOM"
+                            logic = "(.response.statusCode == 200) and (.response.body.private == .payload.body.private)"
+                        }
+                    }
+                }
+            }
+
+            # Issue #285 blocker #4: actions/checkout is pinned to an immutable
+            # commit SHA below (hardcoded literal, not a floating major-version
+            # tag). Verified upstream 2026-07-22 via
+            # https://api.github.com/repos/actions/checkout/git/refs/tags/v4.2.2
+
+            # Only services that opt into build.enabled are assumed to have a
+            # Dockerfile-backed build context in the Gitea source repository.
+            # (buildableServices itself is defined in section 3 above.)
+            buildJobFor = lambda svc: any -> any {
+                ctx = svc.build?.context or "."
+                tag = "${harborRegistry}/${appName}/${svc.name}"
+                # Issue #285 blocker (CI shell injection): `tag` embeds
+                # spec.services[].name and `ctx` is spec.services[].build.context --
+                # both AppClaim input. The XRD (core/crossplane/xrds/application.yaml)
+                # now schema-rejects dangerous values for both at admission time, but
+                # every value interpolated below is ALSO run through `shQuote`
+                # (defense in depth: a future schema relaxation or a different Claim
+                # path must not turn either value into shell syntax). The trailing
+                # `:${{ gitea.sha }}` is deliberately left outside the quoted value
+                # (adjacent, no whitespace, so bash concatenates it into the same
+                # single argument) since that expression is substituted by the
+                # Actions runner with a plain hex commit SHA before the shell ever
+                # runs.
+                quotedTag = shQuote(tag)
+                quotedCtx = shQuote(ctx)
+                quotedRegistry = shQuote(harborRegistry)
+                {
+                    "runs-on" = "ubuntu-latest"
+                    steps = [
+                        # Hardcoded (not interpolated) so the pinned SHA is a
+                        # literal, greppable string in this Composition's source,
+                        # not just in its rendered output.
+                        {uses = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"}
+                        {
+                            # `printf '%s'` replaces `echo` for the secret on stdin
+                            # (echo's backslash-escape handling is
+                            # implementation-defined; printf's is not).
+                            name = "Log in to Harbor"
+                            run = "printf '%s' \"\${{ secrets.HARBOR_ROBOT_SECRET }}\" | docker login ${quotedRegistry} -u \"\${{ secrets.HARBOR_ROBOT_NAME }}\" --password-stdin"
+                        }
+                        {
+                            # `--` isolates the build path from flag parsing even if
+                            # it began with `-`.
+                            name = "Build immutable image"
+                            run = "docker build -t ${quotedTag}:\${{ gitea.sha }} -- ${quotedCtx}"
+                        }
+                        {
+                            name = "Push immutable image"
+                            run = "docker push ${quotedTag}:\${{ gitea.sha }}"
+                        }
+                    ]
+                }
+            }
+
+            noBuildableServicesJob = {
+                "no-buildable-services" = {
+                    "runs-on" = "ubuntu-latest"
+                    steps = [
+                        {
+                            name = "No buildable services"
+                            run = "echo 'No services in this AppClaim have build.enabled; nothing to build. Update services[].image to an already-published image, or set build.enabled: true.'"
+                        }
+                    ]
+                }
+            }
+
+            ciWorkflowJobs = {"build-${svc.name}": buildJobFor(svc) for svc in buildableServices} if len(buildableServices) > 0 else noBuildableServicesJob
+
+            ciWorkflowDoc = {
+                name = "CI"
+                on.push.branches = ["main"]
+                # Workflow-wide (not per-job): every job the runner spawns for
+                # this workflow needs the same CA trust for git (checkout) and
+                # any Node-based action.
+                env = {
+                    GIT_SSL_CAINFO = jobContainerCaCertPath
+                    NODE_EXTRA_CA_CERTS = jobContainerCaCertPath
+                }
+                jobs = ciWorkflowJobs
+            }
+
+            ciWorkflowSource = yaml.encode(ciWorkflowDoc)
+
+            giteaCiWorkflowRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = "${appName}-gitea-cicd"
+                metadata.annotations = annotationFor("gitea-cicd")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["token {{ crossplane-gitea-credentials:crossplane-system:token }}"]
+                        }
+                        payload = {
+                            baseUrl = giteaApiBase
+                            body = json.encode({
+                                content = base64.encode(ciWorkflowSource)
+                                message = "chore: sync Gitea Actions CI workflow (managed by Crossplane AppClaim)"
+                                branch = "main"
+                            })
+                        }
+                        mappings = [
+                            {method = "POST", action = "CREATE", url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/contents/.gitea/workflows/ci.yaml\")", body = ".payload.body"}
+                            {method = "GET", action = "OBSERVE", url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/contents/.gitea/workflows/ci.yaml\")"}
+                            # Runtime blocker (Gitea drift): repairs the workflow file's
+                            # content if it drifts from the freshly-rendered
+                            # ciWorkflowSource (e.g. a new buildable service changes the
+                            # generated CI workflow). Gitea 1.26.1's `PUT
+                            # /repos/{owner}/{repo}/contents/{filepath}`
+                            # (`UpdateFileOptions`) updates-in-place when `sha` is set to
+                            # the file's current blob sha -- `.response.body.sha` is
+                            # exactly the OBSERVE GET's last-recorded value
+                            # (`ContentsResponse.sha`), confirmed against
+                            # templates/swagger/v1_json.tmpl tag v1.26.1.
+                            {
+                                method = "PUT"
+                                action = "UPDATE"
+                                url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/contents/.gitea/workflows/ci.yaml\")"
+                                body = "{sha: .response.body.sha, content: .payload.body.content, message: .payload.body.message, branch: .payload.body.branch}"
+                            }
+                        ]
+                        # CUSTOM (not DEFAULT): decodes and compares the observed file's
+                        # base64 content against the desired, freshly-rendered workflow
+                        # source directly, rather than trusting a bare 2xx GET response as
+                        # "synced" regardless of drift.
+                        expectedResponseCheck = {
+                            type = "CUSTOM"
+                            logic = "(.response.statusCode == 200) and (.response.body.content != null) and ((.response.body.content | gsub(\"\\n\"; \"\") | @base64d) == (.payload.body.content | @base64d))"
+                        }
+                    }
+                }
+            }
+
+            harborProjectRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = "${appName}-harbor-project"
+                metadata.annotations = annotationFor("harbor-project")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["Basic {{ crossplane-harbor-credentials:crossplane-system:basicAuth }}"]
+                        }
+                        payload = {
+                            baseUrl = harborApiBase
+                            body = json.encode({project_name = appName, metadata = {"public" = "true" if giteaVisibility == "public" else "false"}})
+                        }
+                        mappings = [
+                            {method = "POST", action = "CREATE", url = "(.payload.baseUrl + \"/projects\")", body = ".payload.body"}
+                            # Harbor's GET /projects is a *list* endpoint (query param
+                            # "name", returns an array) -- unsuitable for a single-resource
+                            # observe check. HEAD /projects?project_name=<name> is Harbor's
+                            # dedicated existence-check operation (200 if present, 404 if
+                            # not), confirmed against api/v2.0/swagger.yaml (Harbor 2.15.1,
+                            # matching the pinned chart 1.19.1 appVersion).
+                            #
+                            # `action` must be set explicitly here: provider-http v1.0.14's
+                            # requestmapping.GetMapping resolves the OBSERVE mapping either by
+                            # an explicit `action: OBSERVE`, or by falling back to a mapping
+                            # whose bare `method` matches actionToMathodFactoryMap[OBSERVE],
+                            # which is hard-coded to GET -- never HEAD (see
+                            # internal/service/request/requestmapping/mapping.go). Without
+                            # `action: OBSERVE` here, Observe() always errors
+                            # (ErrMappingNotFound), which is NOT the same as "not found yet":
+                            # it blocks Create() from ever running.
+                            {method = "HEAD", action = "OBSERVE", url = "(.payload.baseUrl + \"/projects?project_name=${appName}\")"}
+                        ]
+                    }
+                }
+            }
+
+            harborRobotSecretName = "${appName}-harbor-robot"
+
+            harborRobotRequest = {
+                apiVersion = "http.crossplane.io/v1alpha2"
+                kind = "Request"
+                metadata.name = "${appName}-harbor-robot"
+                metadata.annotations = annotationFor("harbor-robot")
+                spec = {
+                    deletionPolicy = "Orphan"
+                    providerConfigRef.name = "default"
+                    forProvider = {
+                        headers = {
+                            "Content-Type" = ["application/json"]
+                            "Authorization" = ["Basic {{ crossplane-harbor-credentials:crossplane-system:basicAuth }}"]
+                        }
+                        payload = {
+                            baseUrl = harborApiBase
+                            body = json.encode({
+                                name = "${appName}-ci"
+                                duration = -1
+                                level = "project"
+                                permissions = [
+                                    {
+                                        kind = "project"
+                                        namespace = appName
+                                        access = [
+                                            {resource = "repository", action = "push"}
+                                            {resource = "repository", action = "pull"}
+                                        ]
+                                    }
+                                ]
+                            })
+                        }
+                        mappings = [
+                            {method = "POST", action = "CREATE", url = "(.payload.baseUrl + \"/robots\")", body = ".payload.body"}
+                            # Harbor has no "get robot by name" lookup; a robot's numeric ID
+                            # is only known from the CREATE response. provider-http caches
+                            # that response (RequestStatus.Response) and exposes it to later
+                            # Mapping templates as `.response.body...` (see
+                            # examples/sample/request.yaml "Scenario 2"), so the OBSERVE
+                            # mapping fetches GET /robots/{id} using the ID captured from the
+                            # prior CREATE -- the same idempotent, single-resource pattern as
+                            # the harbor-project HEAD check, without requiring HEAD support
+                            # on this endpoint (Harbor's /robots/{robot_id} only supports
+                            # GET/PUT/PATCH/DELETE, confirmed against api/v2.0/swagger.yaml).
+                            # `action: OBSERVE` is explicit for the same GetMapping reason as
+                            # harbor-project above (belt-and-braces; GET already matches the
+                            # default OBSERVE->GET method fallback, but relying on that
+                            # silently would re-break if the method ever changed).
+                            #
+                            # Runtime blocker (crash-safe identity): unlike the bootstrap
+                            # system-level robot (core/crossplane/bootstrap/harbor-robot-
+                            # request.yaml), this OBSERVE stays ID-based rather than a
+                            # Harbor `GET /robots` LIST query. Harbor's ListRobot handler
+                            # (goharbor/harbor v2.15.1 src/server/v2.0/handler/robot.go)
+                            # forces project-scoped queries to require a numeric
+                            # `ProjectID` query keyword whenever `Level=project` is passed,
+                            # and defaults to system-level scope (ProjectID=0) -- which
+                            # never matches this project-level robot -- whenever `Level`
+                            # is omitted. A single provider-http mapping issues exactly one
+                            # HTTP call and cannot first resolve the project's numeric ID,
+                            # so a project-scoped LIST is not achievable here without a
+                            # second, separate HTTP round trip this Request cannot make
+                            # (see tests/test_harbor_robot_hardening.py
+                            # ObserveMappingStillIdBasedTest).
+                            {
+                                method = "GET"
+                                action = "OBSERVE"
+                                url = "(.payload.baseUrl + \"/robots/\" + (.response.body.id | tostring))"
+                            }
+                        ]
+                        # Runtime blocker (crash-safe identity), continued: rather than
+                        # trusting a bare 2xx status (the DEFAULT check), these CUSTOM
+                        # checks verify the ID-based GET response actually is this exact
+                        # robot (name suffix + level=project + namespace=appName +
+                        # push/pull access, nothing more/less). A mismatched/uncertain
+                        # response is reported as both "not synced" and "not removed" --
+                        # it must never be silently trusted as up to date, but must also
+                        # never be misreported as removed (Harbor's own
+                        # `unique_robot UNIQUE(name, project_id)` constraint, confirmed
+                        # via make/migrations/postgresql/0004_1.8.0_schema.up.sql, means a
+                        # re-triggered CREATE against a name that already exists cannot
+                        # silently duplicate it, but repeatedly attempting it is still
+                        # wasted, avoidable work).
+                        isRemovedCheck = {
+                            type = "CUSTOM"
+                            # Only a clean 404 (the ID genuinely no longer resolves) is
+                            # "removed" -- a 200 whose body fails the identity check below
+                            # (wrong/stale identity) is deliberately NOT reported as removed,
+                            # so an uncertain/mismatched response never re-triggers CREATE
+                            # against a name Harbor's own uniqueness constraint already
+                            # holds (see the comment above the mappings for this Request).
+                            logic = ".response.statusCode == 404"
+                        }
+                        # Issue #285 review finding: exact least-privilege enforcement --
+                        # the access array is pinned to exactly 2 entries (push + pull)
+                        # so a drifted robot granted an extra action (e.g. `repository:
+                        # delete`) alongside them is never silently trusted as synced.
+                        #
+                        # Issue #285 review finding (HIGH -- identity check
+                        # redacted before evaluation): this Request's own
+                        # secretInjectionConfigs below map `.body.name`. Per
+                        # provider-http v1.0.14's internal/service/request/
+                        # observe.go IsUpToDate, ApplyResponseDataToSecrets runs
+                        # -- and mutates the same `details.HttpResponse` in
+                        # place -- *before* this expectedResponseCheck ever
+                        # evaluates, so `.response.body.name` would already be
+                        # the `{{secret:ns:key}}` redaction placeholder, not the
+                        # real name, by the time any `r.name`-based clause here
+                        # ran. `level`/`namespace`/`permissions` are never fed
+                        # to a keyMapping, so they're never redacted -- combined
+                        # with the ID-based GET above already pinning identity,
+                        # they're sufficient on their own (a Harbor project's
+                        # `namespace` already uniquely determines which app's
+                        # robot this is).
+                        expectedResponseCheck = {
+                            type = "CUSTOM"
+                            logic = "def isAppRobot(r): r.level == \"project\" and (r.permissions // [] | length) == 1 and (r.permissions[0].kind == \"project\") and (r.permissions[0].namespace == \"${appName}\") and ((r.permissions[0].access // []) | length) == 2 and ((r.permissions[0].access // []) | any(.resource==\"repository\" and .action==\"push\")) and ((r.permissions[0].access // []) | any(.resource==\"repository\" and .action==\"pull\")); (.response.statusCode == 200) and isAppRobot(.response.body)"
+                        }
+                        secretInjectionConfigs = [
+                            {
+                                secretRef = {name = harborRobotSecretName, namespace = appName}
+                                keyMappings = [
+                                    # Runtime blocker (secret preservation): Harbor's OBSERVE
+                                    # response never carries `secret` (only CREATE's response
+                                    # does -- confirmed against goharbor/harbor v2.15.1's
+                                    # handler). Without `missingFieldStrategy: preserve`
+                                    # (default: "delete"), every OBSERVE reconcile after the
+                                    # first would delete the already-injected secret from this
+                                    # Secret.
+                                    {secretKey = "name", responseJQ = ".body.name", missingFieldStrategy = "preserve"}
+                                    {secretKey = "secret", responseJQ = ".body.secret", missingFieldStrategy = "preserve"}
+                                ]
+                            }
+                        ]
+                    }
+                }
+            }
+
+            # Issue #285 blocker #6: the per-app Harbor robot Kubernetes Secret
+            # (harborRobotRequest.secretInjectionConfigs above) never reaches the
+            # Gitea Actions repository secrets the generated CI workflow reads
+            # (secrets.HARBOR_ROBOT_NAME / secrets.HARBOR_ROBOT_SECRET) without
+            # this. Gitea 1.23's actions-secrets API is a single idempotent
+            # create-or-update PUT (confirmed against templates/swagger/v1_json.tmpl
+            # tag v1.23.0: PUT /repos/{owner}/{repo}/actions/secrets/{secretname},
+            # body {"data": "<value>"}, 201 on create / 204 on update) -- one
+            # request per secret name, since Gitea has no batch/multi-secret
+            # endpoint. The value is sourced only from the Secret the Harbor robot
+            # request itself populated via secretInjectionConfigs -- never a
+            # literal -- so this naturally retries until that Secret exists.
+            # Issue #285 review finding (rotated Harbor CI robot credential
+            # propagation): a name-only expectedResponseCheck (below) cannot
+            # distinguish a genuinely up-to-date Gitea secret from a stale
+            # one left over from before the per-app Harbor CI robot was
+            # deleted and recreated (harborRobotRequest re-CREATEs a fresh
+            # robot -- new Harbor-assigned `id`, new `secret` -- whenever its
+            # own isRemovedCheck sees a clean 404). `harborRobotVersion` is
+            # that observable, non-secret robot `id` (see
+            # extractHarborRobotVersion above), read from harborRobotRequest's
+            # own cached OBSERVE response via the same not-metadata-name ocds
+            # slug convention as giteaHeadResponse/resolvedPromotionFor
+            # above. It is embedded below as a Gitea secret `description`
+            # (never the `data`/value) so drift-repair can compare it without
+            # ever reading or logging the credential itself. Before the robot
+            # has ever produced a real observation, "pending" is used as a
+            # deterministic placeholder -- never a crash, and, because it
+            # differs from any real numeric id, it naturally still triggers
+            # a repair once the robot does resolve (never a permanently
+            # "up to date" false negative).
+            harborRobotResponse = ocds["harbor-robot"]?.Resource?.status?.response
+            harborRobotVersion = extractHarborRobotVersion(harborRobotResponse) if giteaCicd else ""
+            harborRobotVersionLabel = harborRobotVersion if harborRobotVersion != "" else "pending"
+
+            giteaActionsSecretRequest = lambda secretName: str, sourceKey: str, robotVersion: str -> any {
+                slug = regex.replace(secretName, "_", "-").lower()
+                desiredDescription = "digiorg-managed harbor-robot-version=${robotVersion}"
+                # Gitea has no get-single-secret endpoint; GET .../actions/secrets
+                # (a *list*, confirmed against code.gitea.io/gitea's
+                # routers/api/v1/repo/action.go ListActionsSecrets @ v1.26.1) is
+                # the only resolvable OBSERVE mapping, and it returns HTTP 200
+                # even for an empty list. provider-http v1.0.14's DEFAULT checks
+                # (internal/service/request/observe/is_deleted_check.go,
+                # is_synced_check.go) only ever treat a 404 as "not found" and
+                # otherwise short-circuit straight to "already up to date"
+                # whenever no UPDATE mapping exists -- without ever looking at
+                # the response body. These two CUSTOM JQ checks replace that
+                # dangerous default with an explicit, response-driven decision
+                # (gojq -- provider-http's actual JQ engine, confirmed via its
+                # go.mod) that never reads the secret *value* (Gitea's list
+                # response never includes it anyway; only `.name`,
+                # `.description`, `.created_at`, per
+                # code.gitea.io/gitea/modules/structs/secret.go @ v1.26.1):
+                #
+                #   isRemovedCheck: true ("removed", which provider-http maps
+                #   to ResourceExists: false -> Create()) when the response
+                #   wasn't a 200, wasn't a JSON array, or this secret's exact
+                #   name is absent -- fails closed toward re-running the
+                #   idempotent CREATE PUT rather than assuming "up to date".
+                #   Deliberately unaffected by `description`/robot-version
+                #   drift: the secret's *name* genuinely still exists in that
+                #   case, so drift must repair via Update(), never re-trigger
+                #   Create() (Gitea's PUT is itself create-or-update, but
+                #   semantically this is an update to an existing resource).
+                #
+                #   expectedResponseCheck: true (synced) only when the
+                #   response was a 200 JSON array containing an entry whose
+                #   name *and* description both match the desired values --
+                #   the description half is what actually detects a rotated
+                #   robot's now-stale secret, which a name-only check would
+                #   silently mask forever. `as $desired` binds
+                #   `.payload.body.description` (the *outer* jqObject) before
+                #   entering `any(...)`, whose predicate runs with `.` bound
+                #   to each array element -- `.payload` is not reachable
+                #   inside the predicate itself.
+                secretAbsentLogic = ".response.statusCode != 200 or (.response.body | type) != \"array\" or (.response.body | map(.name) | index(\"${secretName}\")) == null"
+                secretPresentLogic = "(.payload.body.description) as $desired | (.response.statusCode == 200) and ((.response.body | type) == \"array\") and (.response.body | any(.name == \"${secretName}\" and .description == $desired))"
+                {
+                    apiVersion = "http.crossplane.io/v1alpha2"
+                    kind = "Request"
+                    metadata.name = "${appName}-gitea-secret-${slug}"
+                    metadata.annotations = annotationFor("gitea-secret-${slug}")
+                    spec = {
+                        deletionPolicy = "Orphan"
+                        providerConfigRef.name = "default"
+                        forProvider = {
+                            headers = {
+                                "Content-Type" = ["application/json"]
+                                "Authorization" = ["token {{ crossplane-gitea-credentials:crossplane-system:token }}"]
+                            }
+                            payload = {
+                                baseUrl = giteaApiBase
+                                body = json.encode({
+                                    data = "{{ ${harborRobotSecretName}:${appName}:${sourceKey} }}"
+                                    description = desiredDescription
+                                })
+                            }
+                            mappings = [
+                                # PUT is Gitea's only actions-secrets write verb and is
+                                # itself create-or-update -- `action: CREATE` is explicit
+                                # because provider-http's default CREATE->POST fallback
+                                # would never resolve otherwise (see
+                                # test_provider_http_mapping_contract.py).
+                                {
+                                    method = "PUT"
+                                    action = "CREATE"
+                                    url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/actions/secrets/${secretName}\")"
+                                    body = ".payload.body"
+                                }
+                                {
+                                    method = "GET"
+                                    action = "OBSERVE"
+                                    url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/actions/secrets\")"
+                                }
+                                # Issue #285 review finding: without this explicit
+                                # UPDATE mapping, provider-http v1.0.14 has no
+                                # resolvable UPDATE mapping to run once
+                                # expectedResponseCheck ever reports drift (a rotated
+                                # robot's stale description) -- Update() would
+                                # hard-error every reconcile from then on, a
+                                # permanently-unready Request. Reuses the exact same
+                                # idempotent PUT as CREATE, since Gitea's
+                                # actions-secrets endpoint is create-or-update either
+                                # way.
+                                {
+                                    method = "PUT"
+                                    action = "UPDATE"
+                                    url = "(.payload.baseUrl + \"/repos/DigiOrg/${appName}/actions/secrets/${secretName}\")"
+                                    body = ".payload.body"
+                                }
+                            ]
+                            isRemovedCheck = {
+                                type = "CUSTOM"
+                                logic = secretAbsentLogic
+                            }
+                            expectedResponseCheck = {
+                                type = "CUSTOM"
+                                logic = secretPresentLogic
+                            }
+                        }
+                    }
+                }
+            }
+
+            harborRobotNameToGiteaSecret = giteaActionsSecretRequest("HARBOR_ROBOT_NAME", "name", harborRobotVersionLabel)
+            harborRobotSecretToGiteaSecret = giteaActionsSecretRequest("HARBOR_ROBOT_SECRET", "secret", harborRobotVersionLabel)
+
+            giteaItems = [giteaRepoRequest] if giteaEnabled else []
+            cicdItems = [giteaCiWorkflowRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret] if giteaCicd else []
+
+            # Issue #285 (automatic image promotion): the Harbor-artifact observe
+            # Request only ever renders once giteaHeadSha is known (a valid tag
+            # requires a known commit SHA) -- until then it's simply not created
+            # yet, and resolvedPromotionFor falls back to the previously promoted
+            # digest (if any) for every buildable service.
+            harborArtifactItems = [harborArtifactRequestFor(svc, giteaHeadSha) for svc in buildableServices if giteaHeadSha != ""]
+            pullRobotItems = [pullRobotRequest] if pullSecretShellReady else []
+            promotionItems = ([giteaHeadRequest, pullSecretShellObj] + pullRobotItems + harborArtifactItems + pullSecretSyncItems + pullSecretObservedItems) if promotionEnabled else []
+
+            # dxr status patch (crossplane-contrib/function-kcl v0.12.2 fn_kcl
+            # resource.go ProcessResources Default-target handling: an item whose
+            # apiVersion+kind match the observed XR's own apiVersion+kind is
+            # merged -- via mergo.WithOverride, so this "services" key wholesale
+            # replaces the prior one rather than being deep-merged item-by-item --
+            # into the desired XR's status instead of becoming a composed
+            # resource). Only rendered when promotion is actually in play, so an
+            # AppClaim that never opted into it never gets a stray empty
+            # status.services.
+            statusServices = [
+                {
+                    name = svc.name
+                    headSha = resolvedPromotionFor(svc).headSha
+                    digest = resolvedPromotionFor(svc).digest
+                    image = "${harborRegistry}/${appName}/${svc.name}@${resolvedPromotionFor(svc).digest}" if resolvedPromotionFor(svc).digest != "" else ""
+                }
+                for svc in buildableServices
+            ] if promotionEnabled else []
+            statusPatchItems = [{apiVersion = oxr.apiVersion, kind = oxr.kind, status.services = statusServices}] if promotionEnabled else []
+
+            items = baseItems + databaseItems + serviceItems + messagingItems + giteaItems + cicdItems + promotionItems + statusPatchItems
+
+    - step: automatically-detect-ready-composed-resources
+      functionRef:
+        name: function-auto-ready

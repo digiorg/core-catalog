@@ -6,8 +6,8 @@ metadata:
     platform.digiorg.io/target: local
 data:
   clusterType: local
-  registry: registry.digiorg.local
+  registry: digiorg.local
   ingressClass: nginx
   storageClass: standard
   ingressDomain: digiorg.local
-  giteaURL: http://gitea.digiorg.local:8080
+  giteaURL: https://digiorg.local/gitea
