@@ -1223,11 +1223,20 @@ spec:
                         # not just in its rendered output.
                         {uses = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"}
                         {
+                            # Actions expressions are evaluated before the shell sees
+                            # the script.  Inject credentials as environment values so
+                            # Harbor robot names containing `$` (and arbitrary secret
+                            # metacharacters) remain data instead of becoming shell
+                            # source after expression substitution.
+                            name = "Log in to Harbor"
+                            env = {
+                                HARBOR_ROBOT_NAME = "\${{ secrets.HARBOR_ROBOT_NAME }}"
+                                HARBOR_ROBOT_SECRET = "\${{ secrets.HARBOR_ROBOT_SECRET }}"
+                            }
                             # `printf '%s'` replaces `echo` for the secret on stdin
                             # (echo's backslash-escape handling is
                             # implementation-defined; printf's is not).
-                            name = "Log in to Harbor"
-                            run = "printf '%s' \"\${{ secrets.HARBOR_ROBOT_SECRET }}\" | docker login ${quotedRegistry} -u \"\${{ secrets.HARBOR_ROBOT_NAME }}\" --password-stdin"
+                            run = "printf '%s' \"$HARBOR_ROBOT_SECRET\" | docker login ${quotedRegistry} -u \"$HARBOR_ROBOT_NAME\" --password-stdin"
                         }
                         {
                             # `--` isolates the build path from flag parsing even if
