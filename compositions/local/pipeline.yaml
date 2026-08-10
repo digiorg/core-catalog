@@ -20,6 +20,7 @@ spec:
           source: |
             import regex
             import base64
+            import crypto
             import json
             import yaml
 
@@ -1367,6 +1368,40 @@ spec:
 
             harborRobotSecretName = "${appName}-harbor-robot"
 
+            # The Harbor Request injects its CREATE credential into this
+            # Kubernetes Secret. Read the resulting Secret back through
+            # Crossplane v2 RequiredResources so the Gitea Actions drift marker
+            # can detect an in-place credential repair even when Harbor keeps
+            # the same numeric robot id.
+            harborRobotCredentialRequiredResourcesRequest = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "RequiredResources"
+                requirements = {
+                    harborRobotCredential = {
+                        apiVersion = "v1"
+                        kind = "Secret"
+                        namespace = appName
+                        name = harborRobotSecretName
+                    }
+                }
+            }
+
+            harborRobotCredentialResources = asList(required?.harborRobotCredential)
+            harborRobotCredentialResource = asDict(asDict(harborRobotCredentialResources[0])?.Resource) if len(harborRobotCredentialResources) == 1 else {}
+            harborRobotCredentialMetadata = asDict(harborRobotCredentialResource?.metadata)
+            harborRobotCredentialData = asDict(harborRobotCredentialResource?.data)
+            harborRobotEncodedName = asStr(harborRobotCredentialData?.name)
+            harborRobotEncodedSecret = asStr(harborRobotCredentialData?.secret)
+            harborRobotCredentialIdentityValid = asStr(harborRobotCredentialResource?.apiVersion) == "v1" and asStr(harborRobotCredentialResource?.kind) == "Secret" and asStr(harborRobotCredentialMetadata?.namespace) == appName and asStr(harborRobotCredentialMetadata?.name) == harborRobotSecretName
+            # Kubernetes Secret.data uses padded RFC 4648 base64. Validate the
+            # representation without decoding it: malformed or wrong-shaped
+            # RequiredResources input must remain pending, never become a
+            # trusted drift marker or abort the entire KCL render.
+            paddedBase64Pattern = r'^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$'
+            harborRobotCredentialDataValid = harborRobotEncodedName != "" and harborRobotEncodedSecret != "" and regex.match(harborRobotEncodedName, paddedBase64Pattern) and regex.match(harborRobotEncodedSecret, paddedBase64Pattern)
+            harborRobotCredentialFingerprint = crypto.sha256("${harborRobotEncodedName}:${harborRobotEncodedSecret}") if harborRobotCredentialIdentityValid and harborRobotCredentialDataValid else ""
+            harborRobotCredentialFingerprintLabel = harborRobotCredentialFingerprint if harborRobotCredentialFingerprint != "" else "pending"
+
             harborRobotRequest = {
                 apiVersion = "http.crossplane.io/v1alpha2"
                 kind = "Request"
@@ -1541,7 +1576,14 @@ spec:
 
             giteaActionsSecretRequest = lambda secretName: str, sourceKey: str, robotVersion: str -> any {
                 slug = regex.replace(secretName, "_", "-").lower()
-                desiredDescription = "digiorg-managed harbor-robot-version=${robotVersion}"
+                # Gitea never returns a Secret value. The observable description
+                # therefore carries both the non-secret Harbor robot id and a
+                # one-way digest of the current Kubernetes credential. Hash the
+                # already-base64-encoded fields without decoding or exposing
+                # either value. A stable credential yields a stable marker; any
+                # real name/secret correction yields exactly one drift-repair
+                # UPDATE PUT.
+                desiredDescription = "digiorg-managed harbor-robot-version=${robotVersion} credential-sha256=${harborRobotCredentialFingerprintLabel}"
                 # Gitea has no get-single-secret endpoint; GET .../actions/secrets
                 # (a *list*, confirmed against code.gitea.io/gitea's
                 # routers/api/v1/repo/action.go ListActionsSecrets @ v1.26.1) is
@@ -1660,7 +1702,7 @@ spec:
             harborRobotSecretToGiteaSecret = giteaActionsSecretRequest("HARBOR_ROBOT_SECRET", "secret", harborRobotVersionLabel)
 
             giteaItems = [giteaRepoRequest] if giteaEnabled else []
-            cicdItems = [giteaCiWorkflowRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret] if giteaCicd else []
+            cicdItems = [harborRobotCredentialRequiredResourcesRequest, giteaCiWorkflowRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret] if giteaCicd else []
 
             # Issue #285 (automatic image promotion): the Harbor-artifact observe
             # Request only ever renders once giteaHeadSha is known (a valid tag
