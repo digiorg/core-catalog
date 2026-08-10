@@ -39,6 +39,8 @@ Run:
     python3 -m unittest tests.test_harbor_credential_rotation_propagation -v
 """
 
+import base64
+import hashlib
 import json
 import os
 import shutil
@@ -70,7 +72,25 @@ def _harbor_robot_ocd(robot_id, status_code=200):
     return {"Resource": {"status": {"response": {"statusCode": status_code, "body": body}}}}
 
 
-def _render(appName="rotapp", ocds=None):
+def _required_robot_secret(app_name="rotapp", name=b"robot$rotapp+rotapp-ci", secret=b"credential-a"):
+    return {
+        "harborRobotCredential": [
+            {
+                "Resource": {
+                    "apiVersion": "v1",
+                    "kind": "Secret",
+                    "metadata": {"name": f"{app_name}-harbor-robot", "namespace": app_name},
+                    "data": {
+                        "name": base64.b64encode(name).decode("ascii"),
+                        "secret": base64.b64encode(secret).decode("ascii"),
+                    },
+                }
+            }
+        ]
+    }
+
+
+def _render(appName="rotapp", ocds=None, required=None):
     return render(
         {
             "oxr": make_oxr(
@@ -78,6 +98,7 @@ def _render(appName="rotapp", ocds=None):
                 gitea={"enabled": True, "visibility": "private", "cicd": True},
             ),
             "ocds": ocds if ocds is not None else {},
+            "requiredResources": required if required is not None else {},
         }
     )
 
@@ -161,6 +182,106 @@ class DescriptionEncodesObservableRobotVersionTest(unittest.TestCase):
         for req in _secret_requests(items).values():
             rendered = json.dumps(req)
             self.assertNotIn("s3cr3t", rendered)
+
+
+class InPlaceCredentialRepairFingerprintTest(unittest.TestCase):
+    """A credential repair may preserve Harbor's numeric robot id. The marker
+    must therefore include a stable digest of the current Kubernetes Secret,
+    not only the id, or Gitea keeps the stale pre-repair value forever."""
+
+    def test_required_resources_requests_the_exact_app_robot_secret(self):
+        items = _render()
+        required = [i for i in items if i.get("kind") == "RequiredResources"]
+        self.assertEqual(len(required), 1)
+        requirement = required[0]["requirements"]["harborRobotCredential"]
+        self.assertEqual(requirement["apiVersion"], "v1")
+        self.assertEqual(requirement["kind"], "Secret")
+        self.assertEqual(requirement["namespace"], "rotapp")
+        self.assertEqual(requirement["name"], "rotapp-harbor-robot")
+
+    def test_same_robot_id_but_changed_secret_changes_description(self):
+        observed = {"harbor-robot": _harbor_robot_ocd(ROBOT_ID_A)}
+        before_required = _required_robot_secret(secret=b"credential-a")
+        after_required = _required_robot_secret(secret=b"credential-b")
+        before = _render(ocds=observed, required=before_required)
+        after = _render(ocds=observed, required=after_required)
+        before_desc = json.loads(
+            _secret_requests(before)["HARBOR_ROBOT_SECRET"]["spec"]["forProvider"]["payload"]["body"]
+        )["description"]
+        after_desc = json.loads(
+            _secret_requests(after)["HARBOR_ROBOT_SECRET"]["spec"]["forProvider"]["payload"]["body"]
+        )["description"]
+        self.assertNotEqual(before_desc, after_desc)
+
+        data = after_required["harborRobotCredential"][0]["Resource"]["data"]
+        expected = hashlib.sha256((data["name"] + ":" + data["secret"]).encode()).hexdigest()
+        self.assertIn("credential-sha256=" + expected, after_desc)
+        self.assertNotIn(data["name"], after_desc)
+        self.assertNotIn(data["secret"], after_desc)
+
+    def test_name_and_secret_requests_share_the_same_combined_fingerprint(self):
+        items = _render(
+            ocds={"harbor-robot": _harbor_robot_ocd(ROBOT_ID_A)},
+            required=_required_robot_secret(),
+        )
+        descriptions = {
+            json.loads(req["spec"]["forProvider"]["payload"]["body"])["description"]
+            for req in _secret_requests(items).values()
+        }
+        self.assertEqual(len(descriptions), 1)
+
+    def test_missing_ambiguous_or_wrong_typed_secret_stays_pending_without_crash(self):
+        valid = _required_robot_secret()["harborRobotCredential"][0]
+        wrong_api = json.loads(json.dumps(valid))
+        wrong_api["Resource"]["apiVersion"] = "example.invalid/v1"
+        wrong_kind = json.loads(json.dumps(valid))
+        wrong_kind["Resource"]["kind"] = "ConfigMap"
+        wrong_namespace = json.loads(json.dumps(valid))
+        wrong_namespace["Resource"]["metadata"]["namespace"] = "other"
+        wrong_name = json.loads(json.dumps(valid))
+        wrong_name["Resource"]["metadata"]["name"] = "other-harbor-robot"
+        malformed_name = json.loads(json.dumps(valid))
+        malformed_name["Resource"]["data"]["name"] = "not!base64"
+        malformed_secret = json.loads(json.dumps(valid))
+        malformed_secret["Resource"]["data"]["secret"] = "also-not-base64***"
+        cases = {
+            "missing": {},
+            "ambiguous": {"harborRobotCredential": [valid, valid]},
+            "wrong-api": {"harborRobotCredential": [wrong_api]},
+            "wrong-kind": {"harborRobotCredential": [wrong_kind]},
+            "wrong-namespace": {"harborRobotCredential": [wrong_namespace]},
+            "wrong-name": {"harborRobotCredential": [wrong_name]},
+            "malformed-name-base64": {"harborRobotCredential": [malformed_name]},
+            "malformed-secret-base64": {"harborRobotCredential": [malformed_secret]},
+            "wrong-data-type": {
+                "harborRobotCredential": [
+                    {"Resource": {"data": {"name": 123, "secret": ["not", "a", "string"]}}}
+                ]
+            },
+        }
+        for case, required in cases.items():
+            with self.subTest(case=case):
+                items = _render(
+                    ocds={"harbor-robot": _harbor_robot_ocd(ROBOT_ID_A)},
+                    required=required,
+                )
+                for req in _secret_requests(items).values():
+                    description = json.loads(
+                        req["spec"]["forProvider"]["payload"]["body"]
+                    )["description"]
+                    self.assertIn("credential-sha256=pending", description)
+
+    def test_required_secret_lookup_is_omitted_when_cicd_is_disabled(self):
+        items = render(
+            {
+                "oxr": make_oxr(
+                    appName="nocicd",
+                    gitea={"enabled": True, "visibility": "private", "cicd": False},
+                )
+            }
+        )
+        requirements = [i for i in items if i.get("kind") == "RequiredResources"]
+        self.assertEqual(requirements, [])
 
 
 class StaleDescriptionDetectedAsDriftTest(unittest.TestCase):
