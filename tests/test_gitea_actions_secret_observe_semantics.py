@@ -109,11 +109,11 @@ def _run_jq_bool(logic, context):
     binary (gojq and jq disagree on essentially nothing relevant here --
     both are jq-1.6-superset implementations), against a context object
     shaped the way provider-http's `requestgen.GenerateRequestContext`
-    produces it: `forProvider` fields merged with a `response` key, JSON
-    *strings* already parsed into native structures (that parsing --
-    `internal/json.ConvertJSONStringsToMaps` -- is exactly what turns
-    Gitea's raw JSON-array response body into the `.response.body` array a
-    real reconcile would see)."""
+    produces it: `forProvider` fields merged with a `response` key. Pinned
+    provider-http v1.0.14 recursively converts JSON *object* strings, but its
+    `IsJSONString` helper unmarshals only into `map[string]interface{}`;
+    top-level array strings such as Gitea's actions-secret list therefore
+    remain strings and must be normalized by the rendered checks themselves."""
     if shutil.which("jq") is None:  # pragma: no cover - environment guard
         raise unittest.SkipTest("jq binary not available in this environment")
     proc = subprocess.run(
@@ -277,6 +277,26 @@ class PresentSecretIsUpToDateTest(unittest.TestCase):
                 self.assertTrue(exists)
                 self.assertTrue(synced)
 
+    def test_string_encoded_array_is_up_to_date_like_provider_http_context(self):
+        current_list = _gitea_list_with_both_secrets_current(self.requests)
+        encoded_body = json.dumps(current_list)
+        for name, req in self.requests.items():
+            with self.subTest(name=name):
+                fp = req["spec"]["forProvider"]
+                desired_description = json.loads(fp["payload"]["body"])["description"]
+                exists, synced = _observe(
+                    fp["isRemovedCheck"]["logic"],
+                    fp["expectedResponseCheck"]["logic"],
+                    200,
+                    encoded_body,
+                    payload_description=desired_description,
+                )
+                self.assertTrue(exists)
+                self.assertTrue(
+                    synced,
+                    "provider-http v1.0.14 leaves top-level JSON arrays string-encoded",
+                )
+
     def test_a_secret_present_does_not_falsely_satisfy_the_other_secret_name(self):
         # A list containing only HARBOR_ROBOT_NAME must not make the
         # HARBOR_ROBOT_SECRET Request think it, too, is already up to date.
@@ -322,6 +342,32 @@ class FailClosedOnErrorOrMalformedResponseTest(unittest.TestCase):
                     {"unexpected": "shape"},
                 )
                 self.assertFalse(exists)
+
+    def test_malformed_string_body_returns_a_boolean_and_fails_closed(self):
+        for name, req in self.requests.items():
+            with self.subTest(name=name):
+                fp = req["spec"]["forProvider"]
+                exists, synced = _observe(
+                    fp["isRemovedCheck"]["logic"],
+                    fp["expectedResponseCheck"]["logic"],
+                    200,
+                    "not-json",
+                )
+                self.assertFalse(exists)
+                self.assertFalse(synced)
+
+    def test_array_with_non_object_entries_returns_booleans_and_fails_closed(self):
+        for name, req in self.requests.items():
+            with self.subTest(name=name):
+                fp = req["spec"]["forProvider"]
+                exists, synced = _observe(
+                    fp["isRemovedCheck"]["logic"],
+                    fp["expectedResponseCheck"]["logic"],
+                    200,
+                    ["not-an-object", 7, None],
+                )
+                self.assertFalse(exists)
+                self.assertFalse(synced)
 
     def test_500_fails_closed(self):
         for name, req in self.requests.items():

@@ -1580,8 +1580,15 @@ spec:
                 #   entering `any(...)`, whose predicate runs with `.` bound
                 #   to each array element -- `.payload` is not reachable
                 #   inside the predicate itself.
-                secretAbsentLogic = ".response.statusCode != 200 or (.response.body | type) != \"array\" or (.response.body | map(.name) | index(\"${secretName}\")) == null"
-                secretPresentLogic = "(.payload.body.description) as $desired | (.response.statusCode == 200) and ((.response.body | type) == \"array\") and (.response.body | any(.name == \"${secretName}\" and .description == $desired))"
+                # provider-http v1.0.14 recursively converts JSON object
+                # strings in GenerateRequestContext, but its IsJSONString
+                # helper unmarshals only into map[string]interface{}; Gitea's
+                # top-level JSON array therefore remains string-valued. Normalize
+                # both representations here. Malformed strings become null so
+                # both checks still return booleans and fail closed toward PUT.
+                bodyNormalization = "def observedBody: if (.response.body | type) == \"string\" then (try (.response.body | fromjson) catch null) else .response.body end;"
+                secretAbsentLogic = "${bodyNormalization} .response.statusCode != 200 or (observedBody | type) != \"array\" or (observedBody | all(.[]; type == \"object\") | not) or (observedBody | map(.name) | index(\"${secretName}\")) == null"
+                secretPresentLogic = "${bodyNormalization} (.payload.body.description) as $desired | (.response.statusCode == 200) and ((observedBody | type) == \"array\") and (observedBody | all(.[]; type == \"object\")) and (observedBody | any(.name == \"${secretName}\" and .description == $desired))"
                 {
                     apiVersion = "http.crossplane.io/v1alpha2"
                     kind = "Request"
