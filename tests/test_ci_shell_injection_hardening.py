@@ -188,6 +188,65 @@ class HarborLoginUsesPrintfNotEchoTest(unittest.TestCase):
         self.assertNotRegex(run_line, r"^echo\b")
 
 
+class HarborLoginSecretsCannotBecomeShellSyntaxTest(unittest.TestCase):
+    """Actions secrets are data, not shell source.  In particular Harbor
+    robot names contain ``$`` and must reach docker byte-for-byte."""
+
+    def test_login_secrets_are_injected_via_env_and_preserved_byte_exactly(self):
+        import yaml
+
+        text = _ci_workflow_text(
+            [{"name": "api", "image": "unused", "port": 8080, "build": {"enabled": True}}]
+        )
+        workflow = yaml.safe_load(text)
+        step = next(
+            s for s in workflow["jobs"]["build-api"]["steps"]
+            if s.get("name") == "Log in to Harbor"
+        )
+        self.assertEqual(
+            step.get("env"),
+            {
+                "HARBOR_ROBOT_NAME": "${{ secrets.HARBOR_ROBOT_NAME }}",
+                "HARBOR_ROBOT_SECRET": "${{ secrets.HARBOR_ROBOT_SECRET }}",
+            },
+        )
+        self.assertNotIn("${{ secrets.", step["run"])
+
+        username = "robot$crossplane-system+app-ci"
+        password = 'pa$$`touch "$MARKER_FILE"`$(touch "$MARKER_FILE")'
+        with tempfile.TemporaryDirectory() as tmp:
+            username_file = os.path.join(tmp, "username")
+            password_file = os.path.join(tmp, "password")
+            marker = os.path.join(tmp, "unsafe")
+            script = (
+                "docker() { "
+                "test \"$1\" = login; shift; "
+                "while test $# -gt 0; do "
+                "if test \"$1\" = -u; then printf '%s' \"$2\" >\"$USERNAME_FILE\"; shift 2; "
+                "elif test \"$1\" = --password-stdin; then cat >\"$PASSWORD_FILE\"; shift; "
+                "else shift; fi; done; }\n"
+                + step["run"]
+            )
+            env = dict(os.environ)
+            env.update(
+                HARBOR_ROBOT_NAME=username,
+                HARBOR_ROBOT_SECRET=password,
+                USERNAME_FILE=username_file,
+                PASSWORD_FILE=password_file,
+                MARKER_FILE=marker,
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                timeout=10, env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(username_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), username)
+            with open(password_file, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), password)
+            self.assertFalse(os.path.exists(marker))
+
+
 class QuotingAndDoubleDashPresentTest(unittest.TestCase):
     """Static assertions on the exact rendered shell text, so a regression
     that removes quoting is caught even if it doesn't happen to be
@@ -211,11 +270,12 @@ class QuotingAndDoubleDashPresentTest(unittest.TestCase):
             "docker push 'digiorg.local/shellinj/api':${{ gitea.sha }}",
         )
 
-    def test_login_step_quotes_registry_and_username(self):
+    def test_login_step_quotes_registry_and_environment_username(self):
         text = _ci_workflow_text([{"name": "api", "image": "unused", "port": 8080, "build": {"enabled": True}}])
         run_line = _run_step(text, "build-api", "Log in to Harbor")
         self.assertIn("docker login 'digiorg.local'", run_line)
-        self.assertIn('-u "${{ secrets.HARBOR_ROBOT_NAME }}"', run_line)
+        self.assertIn('-u "$HARBOR_ROBOT_NAME"', run_line)
+        self.assertNotIn("${{ secrets.", run_line)
 
 
 class NormalMultiServiceRenderStillGreenTest(unittest.TestCase):
