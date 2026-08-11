@@ -24,8 +24,21 @@ from render_harness import (  # noqa: E402
     load_pipeline_source,
     make_oxr,
     manifests_of_kind,
+    ready_cicd_context,
     render,
 )
+
+
+def _render_with_ready_cicd(params):
+    """Render final workflow state for tests whose subject is workflow content."""
+    merged = dict(params)
+    ready = ready_cicd_context(params["oxr"]["spec"]["appName"])
+    merged["ocds"] = {**ready["ocds"], **params.get("ocds", {})}
+    merged["requiredResources"] = {
+        **ready["requiredResources"],
+        **params.get("requiredResources", {}),
+    }
+    return render(merged)
 
 
 class BaseAlwaysPresentTest(unittest.TestCase):
@@ -326,7 +339,7 @@ class GiteaCapabilityTest(unittest.TestCase):
         self.assertNotIn("harbor-robot", names)
 
     def test_enabled_public_with_cicd(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {"oxr": make_oxr(appName="pubapp", gitea={"enabled": True, "visibility": "public", "cicd": True})}
         )
         repo_req = self._gitea_repo_request(items)
@@ -425,7 +438,7 @@ class TransportSecurityTest(unittest.TestCase):
             self.assertNotIn(".svc.cluster.local", base_url)
 
     def test_docker_registry_tag_uses_the_trusted_ingress_host(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="tlsbuild",
@@ -439,7 +452,7 @@ class TransportSecurityTest(unittest.TestCase):
         self.assertNotIn(".svc.cluster.local", text)
 
     def test_generated_ci_workflow_trusts_the_ca_for_git_and_node(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="tlsca",
@@ -630,7 +643,7 @@ class CheckoutActionPinTest(unittest.TestCase):
         self.assertIn("actions/checkout@%s" % PINNED_CHECKOUT_SHA, source)
 
     def test_generated_ci_workflow_uses_the_pinned_sha(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="pinapp",
@@ -665,7 +678,7 @@ class MultiServiceBuildContractTest(unittest.TestCase):
             {"name": "worker", "image": "unused", "port": 9090, "build": {"enabled": True}},
             {"name": "cron", "image": "unused", "port": 7070},  # not buildable
         ]
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="buildapp",
@@ -686,7 +699,7 @@ class MultiServiceBuildContractTest(unittest.TestCase):
         self.assertNotIn("buildapp/cron", text, "non-buildable service must never be referenced")
 
     def test_no_buildable_services_renders_an_honest_placeholder_not_a_fake_image(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="nobuild", gitea={"enabled": True, "visibility": "private", "cicd": True}
@@ -698,7 +711,7 @@ class MultiServiceBuildContractTest(unittest.TestCase):
         self.assertEqual(set(workflow["jobs"]), {"no-buildable-services"})
 
     def test_build_context_defaults_to_repository_root(self):
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="ctxdefault",
@@ -719,7 +732,7 @@ class MultiServiceBuildContractTest(unittest.TestCase):
             {"name": s, "image": "unused", "port": 8080, "build": {"enabled": True}}
             for s in ("a", "b", "c")
         ]
-        items = render(
+        items = _render_with_ready_cicd(
             {
                 "oxr": make_oxr(
                     appName="richci",

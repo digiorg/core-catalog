@@ -24,6 +24,7 @@ instant and offline. Set KCL_CLI_BIN to point at an already-installed `kcl`/
     python3 -m unittest discover -s tests -p 'test_*.py'
 """
 
+import base64
 import json
 import os
 import platform
@@ -42,6 +43,65 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PIPELINE_COMPOSITION = os.path.join(
     REPO_ROOT, "compositions", "local", "pipeline.yaml"
 )
+
+
+def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"credential-a"):
+    """Build the observed/required inputs for a converged CI credential stage."""
+    if robot_name is None:
+        robot_name = f"robot${app_name}+{app_name}-ci".encode()
+    encoded_name = base64.b64encode(robot_name).decode("ascii")
+    encoded_secret = base64.b64encode(robot_secret).decode("ascii")
+    fingerprint = sha256(f"{encoded_name}:{encoded_secret}".encode()).hexdigest()
+    description = (
+        f"digiorg-managed harbor-robot-version={robot_id} "
+        f"credential-sha256={fingerprint}"
+    )
+
+    def secret_observation(name):
+        return {
+            "Resource": {
+                "status": {
+                    "response": {
+                        "statusCode": 200,
+                        "body": json.dumps(
+                            [{"name": name, "description": description, "created_at": "x"}]
+                        ),
+                    }
+                }
+            }
+        }
+
+    return {
+        "ocds": {
+            "harbor-robot": {
+                "Resource": {
+                    "status": {
+                        "response": {
+                            "statusCode": 200,
+                            "body": json.dumps({"id": robot_id}),
+                        }
+                    }
+                }
+            },
+            "gitea-secret-harbor-robot-name": secret_observation("HARBOR_ROBOT_NAME"),
+            "gitea-secret-harbor-robot-secret": secret_observation("HARBOR_ROBOT_SECRET"),
+        },
+        "requiredResources": {
+            "harborRobotCredential": [
+                {
+                    "Resource": {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {
+                            "name": f"{app_name}-harbor-robot",
+                            "namespace": app_name,
+                        },
+                        "data": {"name": encoded_name, "secret": encoded_secret},
+                    }
+                }
+            ]
+        },
+    }
 
 # Pinned to match crossplane-contrib/function-kcl v0.12.2's own
 # `kcl-lang.io/cli` dependency exactly (its go.mod pins `kcl-lang.io/cli
