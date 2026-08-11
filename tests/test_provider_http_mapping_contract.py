@@ -43,7 +43,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, render  # noqa: E402
+from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
 
 ACTION_DEFAULT_METHOD = {
     "CREATE": "POST",
@@ -75,12 +75,14 @@ def resolve_mapping(mappings, action):
 
 
 def _richest_render():
+    ready = ready_cicd_context("mapcheck")
     return render(
         {
             "oxr": make_oxr(
                 appName="mapcheck",
                 gitea={"enabled": True, "visibility": "public", "cicd": True},
-            )
+            ),
+            **ready,
         }
     )
 

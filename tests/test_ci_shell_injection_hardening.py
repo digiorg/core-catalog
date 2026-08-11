@@ -39,18 +39,21 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, render  # noqa: E402
+from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
 
 
 def _ci_workflow_text(services, **oxr_kwargs):
+    app_name = oxr_kwargs.pop("appName", "shellinj")
+    ready = ready_cicd_context(app_name)
     items = render(
         {
             "oxr": make_oxr(
-                appName=oxr_kwargs.pop("appName", "shellinj"),
+                appName=app_name,
                 services=services,
                 gitea={"enabled": True, "visibility": "private", "cicd": True},
                 **oxr_kwargs,
-            )
+            ),
+            **ready,
         }
     )
     req = next(
@@ -144,13 +147,15 @@ class ServiceNameCannotBecomeShellSyntaxTest(unittest.TestCase):
     def test_injected_service_name_does_not_execute(self):
         for payload in NAME_INJECTION_PAYLOADS:
             with self.subTest(payload=payload):
+                ready = ready_cicd_context("shellinj")
                 items = render(
                     {
                         "oxr": make_oxr(
                             appName="shellinj",
                             services=[{"name": payload, "image": "unused", "port": 8080, "build": {"enabled": True}}],
                             gitea={"enabled": True, "visibility": "private", "cicd": True},
-                        )
+                        ),
+                        **ready,
                     }
                 )
                 req = next(

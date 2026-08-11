@@ -324,6 +324,10 @@ spec:
                 asDict(json.decode(body) if json.validate(body) else None)
             }
 
+            safeJsonList = lambda body: str -> [any] {
+                asList(json.decode(body) if json.validate(body) else None)
+            }
+
             # `resp` is a provider-http Request's `.status.response` as read via
             # `ocds` -- `.body` is a raw JSON *string* (provider-http v1.0.14
             # apis/*/request/v1alpha2/request_types.go `Response.Body string`),
@@ -1583,6 +1587,33 @@ spec:
             harborRobotVersion = extractHarborRobotVersion(harborRobotResponse) if giteaCicd else ""
             harborRobotVersionLabel = harborRobotVersion if harborRobotVersion != "" else "pending"
 
+            # Fresh-install ordering gate: creating/updating the workflow file is
+            # itself a push to main and can immediately launch Gitea Actions. It
+            # must therefore be the final CI resource, after the real Harbor
+            # robot identity and both repository Actions secrets have been
+            # observed with the current robot-version description. A Request
+            # condition alone is insufficient here: the initial composition
+            # render creates all Requests concurrently, and provider-http may
+            # not have propagated the Secret placeholder value yet.
+            #
+            # On a later credential rotation this condition can temporarily
+            # omit an existing gitea-cicd Request. Its deletionPolicy is Orphan,
+            # so the external workflow file remains in Gitea; once both secret
+            # observations are current, the recreated Request observes the
+            # unchanged file without producing another workflow-content push.
+            giteaActionsSecretObservedCurrent = lambda resp: any, secretName: str, desiredDescription: str -> bool {
+                ok = (resp != None) and (resp?.statusCode == 200) and ((resp?.body or "") != "")
+                entries = safeJsonList(resp.body) if ok else []
+                objectEntries = [entry for entry in entries if typeof(entry) == "dict"]
+                allEntriesAreObjects = len(objectEntries) == len(entries)
+                namedEntries = [
+                    entry
+                    for entry in objectEntries
+                    if asStr(entry?.name) == secretName
+                ]
+                allEntriesAreObjects and (len(namedEntries) == 1) and (asStr(namedEntries[0]?.description) == desiredDescription)
+            }
+
             giteaActionsSecretRequest = lambda secretName: str, sourceKey: str, robotVersion: str -> any {
                 slug = regex.replace(secretName, "_", "-").lower()
                 # Gitea never returns a Secret value. The observable description
@@ -1710,8 +1741,24 @@ spec:
             harborRobotNameToGiteaSecret = giteaActionsSecretRequest("HARBOR_ROBOT_NAME", "name", harborRobotVersionLabel)
             harborRobotSecretToGiteaSecret = giteaActionsSecretRequest("HARBOR_ROBOT_SECRET", "secret", harborRobotVersionLabel)
 
+            giteaRobotNameSecretResponse = ocds["gitea-secret-harbor-robot-name"]?.Resource?.status?.response
+            giteaRobotCredentialSecretResponse = ocds["gitea-secret-harbor-robot-secret"]?.Resource?.status?.response
+            currentRobotNameDescription = asStr(safeJsonObject(harborRobotNameToGiteaSecret.spec.forProvider.payload.body)?.description)
+            currentRobotCredentialDescription = asStr(safeJsonObject(harborRobotSecretToGiteaSecret.spec.forProvider.payload.body)?.description)
+            workflowCredentialsReady = (harborRobotVersion != "") and (harborRobotCredentialFingerprint != "") and giteaActionsSecretObservedCurrent(
+                giteaRobotNameSecretResponse,
+                "HARBOR_ROBOT_NAME",
+                currentRobotNameDescription,
+            ) and giteaActionsSecretObservedCurrent(
+                giteaRobotCredentialSecretResponse,
+                "HARBOR_ROBOT_SECRET",
+                currentRobotCredentialDescription,
+            )
+
             giteaItems = [giteaRepoRequest] if giteaEnabled else []
-            cicdItems = [harborRobotCredentialRequiredResourcesRequest, giteaCiWorkflowRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret] if giteaCicd else []
+            cicdPrerequisiteItems = [harborRobotCredentialRequiredResourcesRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret]
+            cicdWorkflowItems = [giteaCiWorkflowRequest] if workflowCredentialsReady else []
+            cicdItems = cicdPrerequisiteItems + cicdWorkflowItems if giteaCicd else []
 
             # Issue #285 (automatic image promotion): the Harbor-artifact observe
             # Request only ever renders once giteaHeadSha is known (a valid tag

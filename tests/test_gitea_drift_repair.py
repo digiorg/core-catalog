@@ -28,12 +28,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, render  # noqa: E402
+from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
 
 
 def _request(slug, appName="driftapp", **kwargs):
     kwargs.setdefault("gitea", {"enabled": True, "visibility": "private", "cicd": True})
-    items = render({"oxr": make_oxr(appName=appName, **kwargs)})
+    params = {"oxr": make_oxr(appName=appName, **kwargs)}
+    if slug == "gitea-cicd":
+        params.update(ready_cicd_context(appName))
+    items = render(params)
     return next(
         i
         for i in by_kind(items, "Request")
