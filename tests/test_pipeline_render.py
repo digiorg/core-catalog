@@ -34,7 +34,25 @@ def _render_with_ready_cicd(params):
     """Render final workflow state for tests whose subject is workflow content."""
     merged = dict(params)
     ready = ready_cicd_context(params["oxr"]["spec"]["appName"])
-    merged["ocds"] = {**ready["ocds"], **params.get("ocds", {})}
+    buildable = [
+        svc
+        for svc in params["oxr"]["spec"].get("services", [])
+        if svc.get("build", {}).get("enabled", False)
+    ]
+    scaffold_observations = {
+        f"source-scaffold-{i}": {
+            "Resource": {
+                "status": {
+                    "response": {
+                        "statusCode": 200,
+                        "body": json.dumps({"type": "file", "content": "dXNlciBzb3VyY2U="}),
+                    }
+                }
+            }
+        }
+        for i in range(len(buildable))
+    }
+    merged["ocds"] = {**ready["ocds"], **scaffold_observations, **params.get("ocds", {})}
     merged["requiredResources"] = {
         **ready["requiredResources"],
         **params.get("requiredResources", {}),
@@ -733,7 +751,12 @@ class MultiServiceBuildContractTest(unittest.TestCase):
     def test_generated_workflow_is_syntactically_valid_yaml_with_jobs_mapping(self):
         # Belt-and-braces on the richest scenario: three buildable services.
         services = [
-            {"name": s, "image": "unused", "port": 8080, "build": {"enabled": True}}
+            {
+                "name": s,
+                "image": "unused",
+                "port": 8080,
+                "build": {"enabled": True, "context": f"services/{s}"},
+            }
             for s in ("a", "b", "c")
         ]
         items = _render_with_ready_cicd(

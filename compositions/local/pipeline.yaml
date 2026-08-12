@@ -1193,14 +1193,240 @@ spec:
                 }
             }
 
+            # Critical repository identity/readiness sequence. A contents GET also
+            # returns 404 while the repository itself is absent, so the one-shot
+            # scaffold Job must not interpret repository absence as file absence.
+            # Only the exact observed 200 identity is trusted; every missing,
+            # malformed, unauthorized, wrong-identity, or server-error response
+            # fails closed without aborting the KCL render.
+            giteaRepoResponse = ocds["gitea-repo"]?.Resource?.status?.response
+            giteaRepoResponseOk = (giteaRepoResponse != None) and (giteaRepoResponse?.statusCode == 200) and ((giteaRepoResponse?.body or "") != "")
+            giteaRepoBody = safeJsonObject(giteaRepoResponse.body) if giteaRepoResponseOk else {}
+            giteaRepoReady = giteaRepoResponseOk and asStr(giteaRepoBody?.full_name) == "DigiOrg/${appName}"
+
+            # Issue #301 fresh-source scaffold identity has two independent parts:
+            # v1 is the script/template contract; OXR generation is the spec version.
+            # Status-only reconciles retain generation and therefore retain the Job.
+            sourceScaffoldContract = "v1"
+            sourceScaffoldGeneration = oxr.metadata?.generation
+            sourceScaffoldGenerationValid = typeof(sourceScaffoldGeneration) == "int" and sourceScaffoldGeneration > 0
+            sourceScaffoldIdentity = "${sourceScaffoldContract}-g${sourceScaffoldGeneration}" if sourceScaffoldGenerationValid else ""
+            scaffoldBaseImage = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
+            scaffoldCurlImage = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
+            buildContextFor = lambda svc: any -> str {
+                svc.build?.context or "."
+            }
+            buildContexts = [buildContextFor(svc) for svc in buildableServices]
+            conflictingBuildContexts = [
+                ctx
+                for ctx in buildContexts
+                if len([other for other in buildContexts if other == ctx]) > 1
+            ]
+            scaffoldContextsUnambiguous = len(conflictingBuildContexts) == 0
+
+            scaffoldDockerfileFor = lambda svc: any -> str {
+                port = svc.port
+                "FROM ${scaffoldBaseImage}\nRUN printf '%s\\n' 'server {' '    listen ${port};' '    location / {' '        default_type text/plain;' '        return 200 DigiOrg;' '    }' '}' > /etc/nginx/conf.d/default.conf\nEXPOSE ${port}\n"
+            }
+
+            scaffoldFileFor = lambda svc: any -> {str:str} {
+                ctx = buildContextFor(svc)
+                path = "Dockerfile" if ctx == "." else "${ctx}/Dockerfile"
+                {
+                    operation = "create"
+                    path = path
+                    content = base64.encode(scaffoldDockerfileFor(svc))
+                }
+            }
+            # XRD-safe contexts make lexical ordering deterministic and shell inert.
+            scaffoldFiles = [scaffoldFileFor(svc) for svc in buildableServices]
+            scaffoldFilesJsonl = "\n".join([json.encode(entry) for entry in scaffoldFiles]) + "\n"
+            # Keep both provider-kubernetes Object names and inner Job/ConfigMap
+            # names within Kubernetes' 63-character DNS-label limit even for the
+            # XRD's maximum 32-character appName plus an int64 generation.
+            scaffoldJobName = "${appName}-ss-${sourceScaffoldIdentity}"
+
+            # POSIX sh; behavior is executed against a fake Gitea server in tests.
+            # The production defaults are verified TLS. API_BASE/paths are overridable
+            # only to let that same literal script run locally under the test harness.
+            sourceScaffoldScript = r"""set -eu
+            : "${API_BASE:=https://digiorg.local/gitea/api/v1}"
+            : "${APP_NAME:?APP_NAME is required}"
+            : "${TOKEN_FILE:=/var/run/gitea/token}"
+            : "${CA_FILE:=/var/run/digiorg-ca/ca.crt}"
+            : "${FILES_FILE:=/var/run/scaffold/files.jsonl}"
+            : "${WORKSPACE:=/workspace}"
+            : "${RETRY_DELAY:=1}"
+            AUTH_CONFIG="$WORKSPACE/curl-auth.conf"
+            MISSING="$WORKSPACE/missing.jsonl"
+            PAYLOAD="$WORKSPACE/payload.json"
+            STATUS="$WORKSPACE/status"
+            umask 077
+            [ -s "$TOKEN_FILE" ] || exit 1
+            line_count=$(LC_ALL=C wc -l < "$TOKEN_FILE" | tr -d '[:space:]')
+            [ "$line_count" = "0" ] || exit 1
+            cr=$(printf '\r')
+            if LC_ALL=C grep -q "$cr" "$TOKEN_FILE"; then exit 1; fi
+            token=$(cat "$TOKEN_FILE")
+            [ -n "$token" ] || exit 1
+            escaped_token=$(printf '%s' "$token" | sed 's/[\\\"]/\\&/g')
+            printf 'header = "Authorization: token %s"\n' "$escaped_token" > "$AUTH_CONFIG"
+            chmod 600 "$AUTH_CONFIG"
+            token=
+            escaped_token=
+            : > "$MISSING"
+
+            curl_status() {
+              method=$1
+              url=$2
+              config=$3
+              if [ "${API_BASE#https://}" != "$API_BASE" ]; then
+                curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                  --connect-timeout 3 --max-time 10 --cacert "$CA_FILE" \
+                  --config "$AUTH_CONFIG" --config "$config" "$url"
+              else
+                curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                  --connect-timeout 1 --max-time 3 \
+                  --config "$AUTH_CONFIG" --config "$config" "$url"
+              fi
+            }
+
+            get_status() {
+              url=$1
+              attempt=1
+              while [ "$attempt" -le 3 ]; do
+                : > "$STATUS"
+                if code=$(curl_status GET "$url" /dev/null); then
+                  case "$code" in 200|404) printf '%s' "$code"; return 0;; esac
+                fi
+                attempt=$((attempt + 1))
+                [ "$attempt" -le 3 ] && sleep "$RETRY_DELAY"
+              done
+              return 1
+            }
+
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              path=$(printf '%s\n' "$line" | sed -n 's/^.*"path": "\([A-Za-z0-9._\/-]*\)".*$/\1/p')
+              [ -n "$path" ] || exit 1
+              encoded=$(printf '%s' "$path" | sed 's|/|%2F|g')
+              url="$API_BASE/repos/DigiOrg/$APP_NAME/contents/$encoded?ref=main"
+              code=$(get_status "$url") || exit 1
+              case "$code" in
+                200) : ;;
+                404) printf '%s\n' "$line" >> "$MISSING" ;;
+                *) exit 1 ;;
+              esac
+            done < "$FILES_FILE"
+
+            [ -s "$MISSING" ] || exit 0
+            {
+              printf '{"branch":"main","message":"chore: initialize build contexts","files":['
+              first=1
+              while IFS= read -r line; do
+                [ "$first" -eq 1 ] || printf ','
+                first=0
+                printf '%s' "$line"
+              done < "$MISSING"
+              printf ']}'
+            } > "$PAYLOAD"
+            POST_CONFIG="$WORKSPACE/curl-post.conf"
+            printf 'request = "POST"\nheader = "Content-Type: application/json"\ndata-binary = "@%s"\n' "$PAYLOAD" > "$POST_CONFIG"
+            chmod 600 "$POST_CONFIG"
+            post_code=000
+            post_url="$API_BASE/repos/DigiOrg/$APP_NAME/contents"
+            if code=$(curl_status POST "$post_url" "$POST_CONFIG"); then post_code=$code; fi
+            # Never retry the write. 201, a race (409/422), and ambiguous transport
+            # failures all converge through the same authoritative readback.
+            case "$post_code" in 201|409|422|000|*) : ;; esac
+
+            while IFS= read -r line; do
+              [ -n "$line" ] || continue
+              path=$(printf '%s\n' "$line" | sed -n 's/^.*"path": "\([A-Za-z0-9._\/-]*\)".*$/\1/p')
+              [ -n "$path" ] || exit 1
+              encoded=$(printf '%s' "$path" | sed 's|/|%2F|g')
+              code=$(get_status "$API_BASE/repos/DigiOrg/$APP_NAME/contents/$encoded?ref=main") || exit 1
+              [ "$code" = 200 ] || exit 1
+            done < "$FILES_FILE"
+            """
+
+            sourceScaffoldConfigObj = k8sObject("ss-c-${sourceScaffoldIdentity}", {
+                apiVersion = "v1"
+                kind = "ConfigMap"
+                metadata = {name = scaffoldJobName, namespace = "crossplane-system"}
+                data = {"files.jsonl" = scaffoldFilesJsonl}
+            })
+
+            sourceScaffoldJobManifest = {
+                apiVersion = "batch/v1"
+                kind = "Job"
+                metadata = {name = scaffoldJobName, namespace = "crossplane-system"}
+                spec = {
+                    backoffLimit = 0
+                    activeDeadlineSeconds = 180
+                    template.spec = {
+                        automountServiceAccountToken = False
+                        restartPolicy = "Never"
+                        securityContext = {
+                            runAsNonRoot = True
+                            runAsUser = 65534
+                            runAsGroup = 65534
+                            fsGroup = 65534
+                            seccompProfile.type = "RuntimeDefault"
+                        }
+                        containers = [{
+                            name = "scaffold"
+                            image = scaffoldCurlImage
+                            command = ["/bin/sh", "-c"]
+                            args = [sourceScaffoldScript]
+                            env = [{name = "APP_NAME", value = appName}]
+                            securityContext = {
+                                allowPrivilegeEscalation = False
+                                readOnlyRootFilesystem = True
+                                capabilities.drop = ["ALL"]
+                            }
+                            volumeMounts = [
+                                {name = "workspace", mountPath = "/workspace"}
+                                {name = "gitea-token", mountPath = "/var/run/gitea", readOnly = True}
+                                {name = "digiorg-ca", mountPath = "/var/run/digiorg-ca", readOnly = True}
+                                {name = "scaffold-files", mountPath = "/var/run/scaffold", readOnly = True}
+                            ]
+                        }]
+                        volumes = [
+                            {name = "workspace", emptyDir = {}}
+                            {name = "gitea-token", secret = {secretName = "crossplane-gitea-credentials", items = [{key = "token", path = "token"}]}}
+                            {name = "digiorg-ca", secret = {secretName = "digiorg-local-ca", items = [{key = "ca.crt", path = "ca.crt"}]}}
+                            {name = "scaffold-files", configMap = {name = scaffoldJobName, items = [{key = "files.jsonl", path = "files.jsonl"}]}}
+                        ]
+                    }
+                }
+            }
+            sourceScaffoldJobObj = k8sObject("ss-j-${sourceScaffoldIdentity}", sourceScaffoldJobManifest)
+            _sourceScaffoldObserverObj = k8sObject("ss-o-${sourceScaffoldIdentity}", sourceScaffoldJobManifest)
+            _sourceScaffoldObserverObj.spec.managementPolicies = ["Observe"]
+            _sourceScaffoldObserverObj.spec.readiness = {
+                policy = "DeriveFromCelQuery"
+                celQuery = "object.status.conditions.exists(c, c.type == \"Complete\" && c.status == \"True\") && !object.status.conditions.exists(c, c.type == \"Failed\" && c.status == \"True\")"
+            }
+            sourceScaffoldRequired = giteaCicd and len(buildableServices) > 0
+            sourceScaffoldConfigReady = isReadyConditionTrue(ocds["ss-c-${sourceScaffoldIdentity}"]) if sourceScaffoldGenerationValid else False
+            sourceScaffoldConfigItems = [sourceScaffoldConfigObj] if (sourceScaffoldRequired and sourceScaffoldGenerationValid and scaffoldContextsUnambiguous and giteaRepoReady) else []
+            sourceScaffoldExecutionItems = [sourceScaffoldJobObj, _sourceScaffoldObserverObj] if (len(sourceScaffoldConfigItems) == 1 and sourceScaffoldConfigReady) else []
+            sourceScaffoldItems = sourceScaffoldConfigItems + sourceScaffoldExecutionItems
+            scaffoldObserverConditions = asList(ocds["ss-o-${sourceScaffoldIdentity}"]?.Resource?.status?.conditions) if sourceScaffoldGenerationValid else []
+            sourceScaffoldObservedReady = sourceScaffoldGenerationValid and scaffoldContextsUnambiguous and len([
+                c for c in scaffoldObserverConditions
+                if asStr(asDict(c)?.type) == "Ready" and asStr(asDict(c)?.status) == "True"
+            ]) == 1
+            sourceScaffoldsReady = (len(buildableServices) == 0) or sourceScaffoldObservedReady
+
             # Issue #285 blocker #4: actions/checkout is pinned to an immutable
             # commit SHA below (hardcoded literal, not a floating major-version
             # tag). Verified upstream 2026-07-22 via
             # https://api.github.com/repos/actions/checkout/git/refs/tags/v4.2.2
 
-            # Only services that opt into build.enabled are assumed to have a
-            # Dockerfile-backed build context in the Gitea source repository.
-            # (buildableServices itself is defined in section 3 above.)
+            # Only services that opt into build.enabled are included in CI.
+            # Their Dockerfile-backed contexts are guaranteed by the scaffold gate.
             buildJobFor = lambda svc: any -> any {
                 ctx = svc.build?.context or "."
                 tag = "${harborRegistry}/${appName}/${svc.name}"
@@ -1775,8 +2001,8 @@ spec:
             giteaItems = [giteaRepoRequest] if giteaEnabled else []
             harborRobotItems = [harborRobotRequest] if targetNamespaceReady else []
             cicdPrerequisiteItems = [harborRobotCredentialRequiredResourcesRequest, harborProjectRequest] + harborRobotItems + [harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret]
-            cicdWorkflowItems = [giteaCiWorkflowRequest] if workflowCredentialsReady else []
-            cicdItems = cicdPrerequisiteItems + cicdWorkflowItems if giteaCicd else []
+            cicdWorkflowItems = [giteaCiWorkflowRequest] if (giteaRepoReady and workflowCredentialsReady and sourceScaffoldsReady) else []
+            cicdItems = cicdPrerequisiteItems + sourceScaffoldItems + cicdWorkflowItems if giteaCicd else []
 
             # Issue #285 (automatic image promotion): the Harbor-artifact observe
             # Request only ever renders once giteaHeadSha is known (a valid tag

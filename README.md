@@ -62,7 +62,7 @@ What the KCL script actually renders, per `AppClaim`/`Application` field:
 | *(always)* | `Namespace`, `ServiceAccount`, `Role`, `RoleBinding`, `NetworkPolicy` for `spec.appName` |
 | `spec.database.enabled` | Requests `RequiredResources` for the CNPG CRD (`clusters.postgresql.cnpg.io`) and `ValidatingWebhookConfiguration` (`cnpg-validating-webhook-configuration`). If **not** both present, renders **no** `Cluster` and sets a `DatabaseReady=False` Condition (`CnpgPrerequisiteNotReady`) on the composite **and** claim naming the exact prerequisite (`nu scripts/local-setup.nu future-infra`). Only creates the CNPG `Cluster` once both are confirmed present — never coupled to the internal platform database. |
 | `spec.services[]` | Renders a `Deployment` + `Service` + `Ingress` for **every** entry (not index 0 only). For a `build.enabled: true` service, the `Deployment` is withheld entirely until an image is actually promoted (see the automatic image promotion row below) — `spec.services[].image` is never used for such a service, even as a placeholder. |
-| `spec.services[].build.enabled` (with `spec.gitea.enabled && spec.gitea.cicd`) | **Automatic immutable image promotion**: the pipeline observes Gitea's main branch HEAD commit and, per service, whether Harbor already has an artifact tagged with that exact commit SHA. Only once both are confirmed does it pin that service's `Deployment` to the artifact's immutable `<harborRegistry>/<appName>/<service name>@sha256:<digest>` reference — never a mutable tag — and record `headSha`/`digest`/`image` in the composite's own `status.services[]`. A newer HEAD whose build hasn't been pushed yet is a routine pending state: the previously promoted digest is kept (both in status and the running `Deployment`) rather than cleared. Pulls use a separate, pull-only Harbor robot (never the push-capable CI robot above): its raw `name`/`secret` are captured into an intermediate Opaque Secret via provider-http (never constructed by provider-http itself — that would defeat its own response redaction and per-field missing-value handling), then a dedicated, least-privilege provider-kubernetes Job builds the typed `kubernetes.io/dockerconfigjson` Secret out-of-band (shell + `base64`, credential piped to `kubectl apply -f -` over stdin, never argv/logs) and an Observe-only `Object` confirms the real credential actually landed before the `Deployment` (which references it via `imagePullSecrets`) is allowed to render. |
+| `spec.services[].build.enabled` (with `spec.gitea.enabled && spec.gitea.cicd`) | **Safe fresh-source scaffold and automatic immutable image promotion**: after an exact `200` observation confirms the expected `DigiOrg/<appName>` repository identity, a TLS-verified, Secret-file-mounted, hardened one-shot Job creates missing Dockerfiles for the requested build contexts in one create-only batch. Existing source is preserved byte-for-byte, unsafe or malformed responses fail closed, and the workflow is withheld until an Observe-only Job gate confirms completion. The pipeline then observes Gitea's main branch HEAD and matching Harbor artifacts, pins Deployments to immutable digests, and preserves the previous promoted digest while a newer build is pending. Pulls use a separate pull-only Harbor robot and a least-privilege Secret synchronization path. |
 | `spec.messaging.enabled` + `spec.messaging.subjects[]` | Renders a managed NATS JetStream `Stream` + `Consumer` (`jetstream.nats.io/v1beta2`, via the NACK controller — `core/apps/platform/nats-jetstream-controller.yaml`) for **every** subject, plus a `NATS_URL`/`NATS_SUBJECTS` ConfigMap |
 | `spec.gitea.enabled` | Creates the Gitea source repository (`provider-http` `Request`, least-privilege token via `{{ crossplane-gitea-credentials:crossplane-system:token }}` secret placeholder — never a literal credential) with the requested `spec.gitea.visibility` |
 | `spec.gitea.enabled && spec.gitea.cicd` | Additionally creates a `.gitea/workflows/ci.yaml` Gitea Actions matrix workflow (one job per `spec.services[]` entry with `build.enabled: true`, `actions/checkout` pinned to an immutable commit SHA, each pushing `<harborRegistry>/<appName>/<service name>:<gitea.sha>`; if no service opts in, an honest no-op placeholder job renders instead of a fake image), a least-privilege Harbor project, a project-scoped Harbor robot account (secret captured server-side via `secretInjectionConfigs` into a per-app Secret — the robot secret is never written into the Composition, a manifest, or Git), and pushes that robot's `name`/`secret` into the repository's Gitea Actions secrets `HARBOR_ROBOT_NAME`/`HARBOR_ROBOT_SECRET` (Gitea 1.23 `PUT /repos/{owner}/{repo}/actions/secrets/{secretname}`) so the generated workflow's Harbor login actually resolves |
@@ -73,10 +73,8 @@ What the KCL script actually renders, per `AppClaim`/`Application` field:
 `environments/local.yaml` is a Crossplane `EnvironmentConfig` that provides cluster-specific
 values (registry, ingress class, storage class, domain, Gitea URL). It is not
 yet wired into `pipeline.yaml` via a `function-environment-configs` step —
-the URLs the KCL script uses today are inline constants
-(`gitea-http.gitea.svc.cluster.local`, `harbor-core.harbor.svc.cluster.local`,
-`nats.messaging.svc.cluster.local`) matching the in-cluster Service DNS names
-in `digiorg/core`. Wiring `EnvironmentConfig` through is tracked as follow-up
+the environment-specific endpoints the KCL script uses today are inline
+constants. Wiring `EnvironmentConfig` through is tracked as follow-up
 work for the AWS/Azure targets, which will need per-environment values.
 
 ### Functions
@@ -162,10 +160,6 @@ kubectl apply -k compositions/local/
   matching Harbor artifact and promotes the Deployment's image automatically
   — see the automatic image promotion row above. `spec.services[].image` is
   therefore only meaningful for services that never set `build.enabled: true`.
-- CI only builds and pushes images; it does not yet scaffold Dockerfiles or
-  other build-context source files into the Gitea repository for a service
-  that opts into `build.enabled` — the repository owner is expected to add
-  their own build context (a Dockerfile at `services[].build.context`,
-  default the repository root).
+
 - No Azure/AWS Compositions exist yet (`compositions/aws`, `compositions/azure`
   remain placeholders).

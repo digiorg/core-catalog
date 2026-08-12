@@ -45,6 +45,20 @@ from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa
 def _ci_workflow_text(services, **oxr_kwargs):
     app_name = oxr_kwargs.pop("appName", "shellinj")
     ready = ready_cicd_context(app_name)
+    buildable_count = sum(
+        1 for svc in services if svc.get("build", {}).get("enabled", False)
+    )
+    for i in range(buildable_count):
+        ready["ocds"][f"source-scaffold-{i}"] = {
+            "Resource": {
+                "status": {
+                    "response": {
+                        "statusCode": 200,
+                        "body": json.dumps({"type": "file", "content": "dXNlciBzb3VyY2U="}),
+                    }
+                }
+            }
+        }
     items = render(
         {
             "oxr": make_oxr(

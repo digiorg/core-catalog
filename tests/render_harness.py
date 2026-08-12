@@ -58,7 +58,7 @@ def active_namespace_requirement(app_name):
 
 
 def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"credential-a"):
-    """Build the observed/required inputs for a converged CI credential stage."""
+    """Build observed/required inputs for converged CI credentials and source."""
     if robot_name is None:
         robot_name = f"robot${app_name}+{app_name}-ci".encode()
     encoded_name = base64.b64encode(robot_name).decode("ascii")
@@ -85,6 +85,20 @@ def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"cr
 
     return {
         "ocds": {
+            "gitea-repo": {
+                "Resource": {
+                    "status": {
+                        "response": {
+                            "statusCode": 200,
+                            "body": json.dumps({
+                                "full_name": f"DigiOrg/{app_name}",
+                                "name": app_name,
+                                "owner": {"login": "DigiOrg"},
+                            }),
+                        }
+                    }
+                }
+            },
             "harbor-robot": {
                 "Resource": {
                     "status": {
@@ -97,6 +111,12 @@ def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"cr
             },
             "gitea-secret-harbor-robot-name": secret_observation("HARBOR_ROBOT_NAME"),
             "gitea-secret-harbor-robot-secret": secret_observation("HARBOR_ROBOT_SECRET"),
+            "ss-c-v1-g1": {
+                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+            },
+            "ss-o-v1-g1": {
+                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+            },
         },
         "requiredResources": {
             "targetNamespace": active_namespace_requirement(app_name),
@@ -331,6 +351,7 @@ def make_oxr(
     appName="myapp",
     team="platform-team",
     size="S",
+    generation=1,
     database=None,
     services=None,
     gitea=None,
@@ -356,7 +377,7 @@ def make_oxr(
     return {
         "apiVersion": "platform.digiorg.io/v1alpha1",
         "kind": "Application",
-        "metadata": {"name": appName},
+        "metadata": {"name": appName, "generation": generation},
         "spec": spec,
         "status": {},
     }

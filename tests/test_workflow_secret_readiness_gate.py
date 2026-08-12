@@ -75,7 +75,25 @@ def _render(ocds, required=None):
             gitea={"enabled": True, "visibility": "private", "cicd": True},
             services=[{"name": "api", "image": "unused", "port": 8080, "build": {"enabled": True, "context": "."}}],
         ),
-        "ocds": ocds,
+        "ocds": {
+            "gitea-repo": {
+                "Resource": {
+                    "status": {
+                        "response": {
+                            "statusCode": 200,
+                            "body": json.dumps({"full_name": "DigiOrg/gateapp"}),
+                        }
+                    }
+                }
+            },
+            "ss-o-v1-g1": {
+                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+            },
+            "ss-c-v1-g1": {
+                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+            },
+            **ocds,
+        },
         "requiredResources": _required_robot_secret() if required is None else required,
     })
 
