@@ -53,7 +53,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, load_pipeline_source, make_oxr, render  # noqa: E402
+from render_harness import active_namespace_requirement, by_kind, load_pipeline_source, make_oxr, render  # noqa: E402
 
 RAW_FIELD_PATH = re.compile(r"^\.body\.[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -140,7 +140,10 @@ def _pull_robot_request(appName="credapp"):
 
 def _harbor_robot_request(appName="credapp"):
     items = render(
-        {"oxr": make_oxr(appName=appName, gitea={"enabled": True, "visibility": "private", "cicd": True})}
+        {
+            "oxr": make_oxr(appName=appName, gitea={"enabled": True, "visibility": "private", "cicd": True}),
+            "requiredResources": {"targetNamespace": active_namespace_requirement(appName)},
+        }
     )
     return next(
         i
@@ -168,6 +171,7 @@ class NoCompoundConstructedSecretValuesAnywhereTest(unittest.TestCase):
                 "ocds": {
                     "harbor-pull-secret": {"Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}},
                 },
+                "requiredResources": {"targetNamespace": active_namespace_requirement("structcheck")},
             }
         )
         checked = 0

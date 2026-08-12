@@ -49,6 +49,14 @@ def _secret_response(name, description=DESCRIPTION, status=200, body=None):
 
 def _required_robot_secret():
     return {
+        "targetNamespace": [{
+            "Resource": {
+                "apiVersion": "v1",
+                "kind": "Namespace",
+                "metadata": {"name": "gateapp"},
+                "status": {"phase": "Active"},
+            }
+        }],
         "harborRobotCredential": [{
             "Resource": {
                 "apiVersion": "v1",
@@ -152,7 +160,7 @@ class WorkflowCredentialGateTest(unittest.TestCase):
             "harbor-robot": _robot_response(),
             "gitea-secret-harbor-robot-name": _secret_response("HARBOR_ROBOT_NAME"),
             "gitea-secret-harbor-robot-secret": _secret_response("HARBOR_ROBOT_SECRET"),
-        }, required={}))
+        }, required={"targetNamespace": _required_robot_secret()["targetNamespace"]}))
 
     def test_duplicate_matching_secret_metadata_fails_closed(self):
         duplicate_body = json.dumps([

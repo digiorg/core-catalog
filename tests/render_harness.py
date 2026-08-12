@@ -45,6 +45,18 @@ PIPELINE_COMPOSITION = os.path.join(
 )
 
 
+def active_namespace_requirement(app_name):
+    """Observed exact Active Namespace required before one-shot credential creation."""
+    return [{
+        "Resource": {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": app_name},
+            "status": {"phase": "Active"},
+        }
+    }]
+
+
 def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"credential-a"):
     """Build the observed/required inputs for a converged CI credential stage."""
     if robot_name is None:
@@ -87,6 +99,7 @@ def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"cr
             "gitea-secret-harbor-robot-secret": secret_observation("HARBOR_ROBOT_SECRET"),
         },
         "requiredResources": {
+            "targetNamespace": active_namespace_requirement(app_name),
             "harborRobotCredential": [
                 {
                     "Resource": {
