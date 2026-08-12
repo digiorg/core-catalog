@@ -34,7 +34,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, manifests_of_kind, render  # noqa: E402
+from render_harness import active_namespace_requirement, by_kind, make_oxr, manifests_of_kind, render  # noqa: E402
 from test_provider_http_mapping_contract import (  # noqa: E402
     MappingNotFound,
     resolve_mapping,
@@ -149,7 +149,11 @@ def _render(appName="promoapp", services=None, ocds=None, prev_status_services=N
     )
     if prev_status_services is not None:
         oxr["status"] = {"services": prev_status_services}
-    params = {"oxr": oxr, "ocds": ocds if ocds is not None else {}}
+    params = {
+        "oxr": oxr,
+        "ocds": ocds if ocds is not None else {},
+        "requiredResources": {"targetNamespace": active_namespace_requirement(appName)},
+    }
     return render(params)
 
 

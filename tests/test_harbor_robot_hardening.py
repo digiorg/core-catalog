@@ -39,7 +39,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, render  # noqa: E402
+from render_harness import active_namespace_requirement, by_kind, make_oxr, render  # noqa: E402
 
 
 def _harbor_robot_request(appName="hardenapp"):
@@ -48,7 +48,8 @@ def _harbor_robot_request(appName="hardenapp"):
             "oxr": make_oxr(
                 appName=appName,
                 gitea={"enabled": True, "visibility": "private", "cicd": True},
-            )
+            ),
+            "requiredResources": {"targetNamespace": active_namespace_requirement(appName)},
         }
     )
     return next(

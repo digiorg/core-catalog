@@ -1390,6 +1390,18 @@ spec:
                 apiVersion = "meta.krm.kcl.dev/v1alpha1"
                 kind = "RequiredResources"
                 requirements = {
+                    # The Harbor robot CREATE response contains its credential
+                    # exactly once. Releasing that external CREATE concurrently
+                    # with this Composition's Namespace Object can make provider-
+                    # http create the Harbor robot while Secret injection fails
+                    # with Kubernetes NotFound. OBSERVE cannot recover Harbor's
+                    # write-only credential, so require the exact target Namespace
+                    # to be Active before rendering the robot Request.
+                    targetNamespace = {
+                        apiVersion = "v1"
+                        kind = "Namespace"
+                        name = appName
+                    }
                     harborRobotCredential = {
                         apiVersion = "v1"
                         kind = "Secret"
@@ -1414,6 +1426,11 @@ spec:
             harborRobotCredentialDataValid = harborRobotEncodedName != "" and harborRobotEncodedSecret != "" and regex.match(harborRobotEncodedName, paddedBase64Pattern) and regex.match(harborRobotEncodedSecret, paddedBase64Pattern)
             harborRobotCredentialFingerprint = crypto.sha256("${harborRobotEncodedName}:${harborRobotEncodedSecret}") if harborRobotCredentialIdentityValid and harborRobotCredentialDataValid else ""
             harborRobotCredentialFingerprintLabel = harborRobotCredentialFingerprint if harborRobotCredentialFingerprint != "" else "pending"
+
+            targetNamespaceResources = asList(required?.targetNamespace)
+            targetNamespaceResource = asDict(asDict(targetNamespaceResources[0])?.Resource) if len(targetNamespaceResources) == 1 else {}
+            targetNamespaceMetadata = asDict(targetNamespaceResource?.metadata)
+            targetNamespaceReady = asStr(targetNamespaceResource?.apiVersion) == "v1" and asStr(targetNamespaceResource?.kind) == "Namespace" and asStr(targetNamespaceMetadata?.name) == appName and "namespace" not in targetNamespaceMetadata and "deletionTimestamp" not in targetNamespaceMetadata and asStr(asDict(targetNamespaceResource?.status)?.phase) == "Active"
 
             harborRobotRequest = {
                 apiVersion = "http.crossplane.io/v1alpha2"
@@ -1756,7 +1773,8 @@ spec:
             )
 
             giteaItems = [giteaRepoRequest] if giteaEnabled else []
-            cicdPrerequisiteItems = [harborRobotCredentialRequiredResourcesRequest, harborProjectRequest, harborRobotRequest, harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret]
+            harborRobotItems = [harborRobotRequest] if targetNamespaceReady else []
+            cicdPrerequisiteItems = [harborRobotCredentialRequiredResourcesRequest, harborProjectRequest] + harborRobotItems + [harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret]
             cicdWorkflowItems = [giteaCiWorkflowRequest] if workflowCredentialsReady else []
             cicdItems = cicdPrerequisiteItems + cicdWorkflowItems if giteaCicd else []
 

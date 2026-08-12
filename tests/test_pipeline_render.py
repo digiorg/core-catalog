@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from render_harness import (  # noqa: E402
     PIPELINE_COMPOSITION,
+    active_namespace_requirement,
     by_kind,
     load_pipeline_source,
     make_oxr,
@@ -385,7 +386,10 @@ class HarborRobotSecretInjectionTest(unittest.TestCase):
 
     def test_robot_response_captured_via_secret_injection_not_literal(self):
         items = render(
-            {"oxr": make_oxr(appName="secapp", gitea={"enabled": True, "visibility": "public", "cicd": True})}
+            {
+                "oxr": make_oxr(appName="secapp", gitea={"enabled": True, "visibility": "public", "cicd": True}),
+                "requiredResources": {"targetNamespace": active_namespace_requirement("secapp")},
+            }
         )
         robot_req = next(
             i
