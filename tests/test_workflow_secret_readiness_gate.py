@@ -15,7 +15,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
-from render_harness import by_kind, make_oxr, render  # noqa: E402
+from render_harness import by_kind, make_oxr, render_with_ready_scaffold  # noqa: E402
 
 ROBOT_ID = 42
 ENCODED_NAME = base64.b64encode(b"robot$gateapp+gateapp-ci").decode("ascii")
@@ -69,7 +69,7 @@ def _required_robot_secret():
 
 
 def _render(ocds, required=None):
-    return render({
+    return render_with_ready_scaffold({
         "oxr": make_oxr(
             appName="gateapp",
             gitea={"enabled": True, "visibility": "private", "cicd": True},
@@ -85,12 +85,6 @@ def _render(ocds, required=None):
                         }
                     }
                 }
-            },
-            "ss-o-v1-g1": {
-                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
-            },
-            "ss-c-v1-g1": {
-                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
             },
             **ocds,
         },

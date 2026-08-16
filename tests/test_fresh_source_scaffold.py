@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Issue #301: safe, atomic fresh-source scaffolding contracts and behavior."""
 import base64
+import hashlib
 import json
 import os
 
@@ -15,7 +16,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, os.path.dirname(__file__))
 from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
 
-MARKER = "v1"
+MARKER = "v2"
 NGINX = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
 CURL_IMAGE = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
 TEST_TOKEN = 'tok en;$`"\\sentinel'
@@ -40,29 +41,35 @@ def _render(services=None, observer=None, credentials_ready=True, gitea=None,
     ]
     ready = ready_cicd_context(app)
     ready["ocds"].pop("source-scaffold-0", None)
-    # Tests in this module control the generation-specific observer explicitly.
-    ready["ocds"].pop(f"ss-o-{MARKER}-g1", None)
-    ready["ocds"].pop(f"ss-c-{MARKER}-g1", None)
-    ready["ocds"][f"ss-c-{MARKER}-g{generation}"] = _condition("True")
     if repo_observation == "ready":
         ready["ocds"]["gitea-repo"] = _repo_response()
     elif repo_observation is None:
         ready["ocds"].pop("gitea-repo", None)
     else:
         ready["ocds"]["gitea-repo"] = repo_observation
-    if observer is not None:
-        ready["ocds"][f"ss-o-{MARKER}-g{generation}"] = observer
-    ready["ocds"].update(extra_ocds or {})
-    return render({
-        "oxr": make_oxr(
+    oxr = make_oxr(
             appName=app,
             gitea=gitea or {"enabled": True, "visibility": "private", "cicd": True},
             services=services,
             generation=generation,
-        ),
+        )
+    params = {
+        "oxr": oxr,
         "ocds": ready["ocds"] if credentials_ready else {},
         "requiredResources": ready["requiredResources"] if credentials_ready else {},
-    })
+    }
+    initial = render(params)
+    config_slugs = sorted(
+        slug for slug in (_slug(item) for item in initial)
+        if (slug or "").startswith(f"ss-c-{MARKER}-r")
+    )
+    if credentials_ready and len(config_slugs) == 1:
+        identity = config_slugs[0].removeprefix("ss-c-")
+        ready["ocds"][config_slugs[0]] = _condition("True")
+        if observer is not None:
+            ready["ocds"][f"ss-o-{identity}"] = observer
+    ready["ocds"].update(extra_ocds or {})
+    return render(params)
 
 
 def _slug(item):
@@ -83,35 +90,69 @@ def _manifest(obj):
     return obj["spec"]["forProvider"]["manifest"]
 
 
+def _scaffold_slug(items, kind):
+    matches = sorted(
+        name for name in _objects(items)
+        if name.startswith(f"ss-{kind}-{MARKER}-r")
+    )
+    if len(matches) != 1:
+        raise AssertionError(f"expected one scaffold {kind} resource, got {matches}")
+    return matches[0]
+
+
 def _job_and_script(items):
     objects = _objects(items)
-    job_obj = next(v for k, v in objects.items() if k.startswith(f"ss-j-{MARKER}-g"))
+    job_obj = objects[_scaffold_slug(items, "j")]
     job = _manifest(job_obj)
     container = job["spec"]["template"]["spec"]["containers"][0]
     return job_obj, job, container, container["args"][0]
 
 
 class RenderContractTest(unittest.TestCase):
-    def test_generation_is_part_of_job_resource_and_observer_identity(self):
-        first = _objects(_render(generation=1))
-        same = _objects(_render(generation=1))
-        second = _objects(_render(generation=2))
+    def test_resource_ref_generation_bump_does_not_rotate_scaffold_identity(self):
+        first = _objects(_render(generation=7))
+        bumped = _objects(_render(generation=8))
 
         for prefix in ("c", "j", "o"):
-            slug1 = f"ss-{prefix}-{MARKER}-g1"
-            slug2 = f"ss-{prefix}-{MARKER}-g2"
-            self.assertIn(slug1, first)
-            self.assertIn(slug1, same)
-            self.assertIn(slug2, second)
-            self.assertNotIn(slug1, second)
-        self.assertEqual(
-            _manifest(first[f"ss-j-{MARKER}-g1"])["metadata"]["name"],
-            "myapp-ss-v1-g1",
+            first_slugs = {name for name in first if name.startswith(f"ss-{prefix}-")}
+            bumped_slugs = {name for name in bumped if name.startswith(f"ss-{prefix}-")}
+            self.assertEqual(first_slugs, bumped_slugs)
+
+    def test_dockerfile_relevant_input_rotates_scaffold_identity(self):
+        first = _render(services=[
+            {"name": "web", "image": "unused", "port": 8080,
+             "build": {"enabled": True, "context": "."}},
+        ])
+        changed = _render(services=[
+            {"name": "web", "image": "unused", "port": 9090,
+             "build": {"enabled": True, "context": "."}},
+        ])
+
+        for prefix in ("c", "j", "o"):
+            self.assertNotEqual(
+                _scaffold_slug(first, prefix),
+                _scaffold_slug(changed, prefix),
+            )
+
+    def test_previous_revision_observer_does_not_unlock_changed_scaffold(self):
+        old_services = [
+            {"name": "web", "image": "unused", "port": 8080,
+             "build": {"enabled": True, "context": "."}},
+        ]
+        new_services = [
+            {"name": "web", "image": "unused", "port": 9090,
+             "build": {"enabled": True, "context": "."}},
+        ]
+        old_items = _render(old_services, observer=_condition("True"))
+        old_observer = _scaffold_slug(old_items, "o")
+        self.assertIn("gitea-cicd", _requests(old_items))
+
+        new_items = _render(
+            new_services,
+            extra_ocds={old_observer: _condition("True")},
         )
-        self.assertEqual(
-            _manifest(second[f"ss-o-{MARKER}-g2"])["metadata"]["name"],
-            "myapp-ss-v1-g2",
-        )
+        self.assertNotEqual(old_observer, _scaffold_slug(new_items, "o"))
+        self.assertNotIn("gitea-cicd", _requests(new_items))
 
     def test_max_app_name_and_int64_generation_fit_kubernetes_dns_names(self):
         app = "a" * 32
@@ -120,8 +161,7 @@ class RenderContractTest(unittest.TestCase):
         ready["ocds"]["gitea-repo"] = _repo_response(
             body={"full_name": f"DigiOrg/{app}"}
         )
-        ready["ocds"][f"ss-c-{MARKER}-g{generation}"] = _condition("True")
-        items = render({
+        params = {
             "oxr": make_oxr(
                 appName=app, generation=generation,
                 gitea={"enabled": True, "visibility": "private", "cicd": True},
@@ -129,10 +169,14 @@ class RenderContractTest(unittest.TestCase):
                            "build": {"enabled": True, "context": "."}}],
             ),
             **ready,
-        })
+        }
+        initial = render(params)
+        config_slug = _scaffold_slug(initial, "c")
+        ready["ocds"][config_slug] = _condition("True")
+        items = render(params)
         scaffold_objects = [
             item for item in by_kind(items, "Object")
-            if "-v1-g" in (_slug(item) or "")
+            if ("-v2-r" in (_slug(item) or ""))
         ]
         self.assertEqual(len(scaffold_objects), 3)
         for item in scaffold_objects:
@@ -140,32 +184,8 @@ class RenderContractTest(unittest.TestCase):
                 self.assertLessEqual(len(name), 63, name)
                 self.assertRegex(name, r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
-    def test_realistic_fresh_xr_generation_seven_uses_generation_seven_identity(self):
-        oxr = make_oxr(
-            appName="myapp", generation=7,
-            gitea={"enabled": True, "visibility": "private", "cicd": True},
-            services=[{"name": "web", "image": "x", "port": 8080,
-                       "build": {"enabled": True, "context": "."}}],
-        )
-        oxr["status"]["conditions"] = [{
-            "type": "Synced", "status": "True", "observedGeneration": 7,
-        }]
-        self.assertEqual(oxr["metadata"]["generation"], 7)
-        self.assertEqual(oxr["status"]["conditions"][0]["observedGeneration"], 7)
-        ready = ready_cicd_context("myapp")
-        ready["ocds"][f"ss-c-{MARKER}-g7"] = _condition("True")
-        # Render a semantically equivalent fresh OXR; mutating option("params") data
-        # makes this KCL CLI version echo params as an additional top-level document.
-        oxr["status"] = {}
-        items = render({"oxr": oxr, **ready})
-        self.assertIn(f"ss-j-{MARKER}-g7", _objects(items))
-
-    def test_new_generation_waits_for_its_own_observer(self):
-        old_ready = {f"ss-o-{MARKER}-g1": _condition("True")}
-        self.assertNotIn("gitea-cicd", _requests(_render(generation=2, extra_ocds=old_ready)))
-        self.assertIn("gitea-cicd", _requests(_render(generation=2, observer=_condition("True"))))
-
-    def test_missing_or_malformed_generation_fails_closed(self):
+    def test_generation_is_not_required_for_stable_scaffold_identity(self):
+        identities = []
         for generation in (None, "2", 0, -1, 1.5):
             with self.subTest(generation=generation):
                 oxr = make_oxr(
@@ -177,10 +197,10 @@ class RenderContractTest(unittest.TestCase):
                 if generation is None:
                     oxr["metadata"].pop("generation")
                 ready = ready_cicd_context("myapp")
+                ready["ocds"]["gitea-repo"] = _repo_response()
                 items = render({"oxr": oxr, **ready})
-                slugs = {_slug(item) for item in items}
-                self.assertFalse(any((slug or "").startswith("ss-") for slug in slugs))
-                self.assertNotIn("gitea-cicd", slugs)
+                identities.append(_scaffold_slug(items, "c"))
+        self.assertEqual(len(set(identities)), 1)
 
     def test_repo_request_always_renders_but_scaffold_requires_exact_repo_identity(self):
         unsafe = {
@@ -197,27 +217,44 @@ class RenderContractTest(unittest.TestCase):
                 items = _render(repo_observation=observation)
                 self.assertIn("gitea-repo", _requests(items))
                 objects = _objects(items)
-                self.assertNotIn(f"ss-j-{MARKER}-g1", objects)
-                self.assertNotIn(f"ss-o-{MARKER}-g1", objects)
+                self.assertFalse(any(name.startswith("ss-j-") for name in objects))
+                self.assertFalse(any(name.startswith("ss-o-") for name in objects))
                 self.assertNotIn("gitea-cicd", _requests(items))
 
         ready_items = _render(repo_observation=_repo_response())
-        self.assertIn(f"ss-c-{MARKER}-g1", _objects(ready_items))
+        self.assertTrue(_scaffold_slug(ready_items, "c"))
 
     def test_config_object_readiness_sequences_job_and_observer_across_reconciles(self):
         ready = ready_cicd_context("myapp")
-        ready["ocds"].pop(f"ss-c-{MARKER}-g1", None)
-        initial = _render(extra_ocds={f"ss-c-{MARKER}-g1": {}})
+        ready["ocds"]["gitea-repo"] = _repo_response()
+        params = {
+            "oxr": make_oxr(
+                appName="myapp", generation=7,
+                gitea={"enabled": True, "visibility": "private", "cicd": True},
+                services=[{"name": "web", "image": "unused", "port": 8080,
+                           "build": {"enabled": True, "context": "."}}],
+            ),
+            **ready,
+        }
+        initial = render(params)
         initial_objects = _objects(initial)
-        self.assertIn(f"ss-c-{MARKER}-g1", initial_objects)
-        self.assertNotIn(f"ss-j-{MARKER}-g1", initial_objects)
-        self.assertNotIn(f"ss-o-{MARKER}-g1", initial_objects)
+        config_slug = _scaffold_slug(initial, "c")
+        identity = config_slug.removeprefix("ss-c-")
+        self.assertFalse(any(name.startswith("ss-j-") for name in initial_objects))
+        self.assertFalse(any(name.startswith("ss-o-") for name in initial_objects))
         self.assertNotIn("gitea-cicd", _requests(initial))
 
-        config_ready = _render(extra_ocds={f"ss-c-{MARKER}-g1": _condition("True")})
+        ready["ocds"][config_slug] = _condition("True")
+        params["oxr"]["metadata"]["generation"] = 8
+        params["oxr"]["spec"]["resourceRefs"] = [{
+            "apiVersion": "kubernetes.crossplane.io/v1alpha2",
+            "kind": "Object",
+            "name": f"myapp-{config_slug}",
+        }]
+        config_ready = render(params)
         config_objects = _objects(config_ready)
-        self.assertIn(f"ss-j-{MARKER}-g1", config_objects)
-        self.assertIn(f"ss-o-{MARKER}-g1", config_objects)
+        self.assertIn(f"ss-j-{identity}", config_objects)
+        self.assertIn(f"ss-o-{identity}", config_objects)
         self.assertNotIn("gitea-cicd", _requests(config_ready))
 
     def test_scaffold_uses_no_provider_http_request(self):
@@ -225,18 +262,25 @@ class RenderContractTest(unittest.TestCase):
         scaffold_http = [x for x in by_kind(items, "Request") if "source-scaffold" in (_slug(x) or "")]
         self.assertEqual(scaffold_http, [])
 
-    def test_job_and_observer_have_explicit_v1_marker_and_exact_identity(self):
-        objects = _objects(_render())
-        self.assertIn(f"ss-j-{MARKER}-g1", objects)
-        self.assertIn(f"ss-o-{MARKER}-g1", objects)
-        job_obj = objects[f"ss-j-{MARKER}-g1"]
-        observer = objects[f"ss-o-{MARKER}-g1"]
+    def test_job_and_observer_have_explicit_v2_marker_and_exact_revision(self):
+        items = _render()
+        objects = _objects(items)
+        config_slug = _scaffold_slug(items, "c")
+        job_slug = _scaffold_slug(items, "j")
+        observer_slug = _scaffold_slug(items, "o")
+        files_jsonl = _manifest(objects[config_slug])["data"]["files.jsonl"]
+        expected_revision = hashlib.sha256(files_jsonl.encode()).hexdigest()[:20]
+        self.assertEqual(config_slug, f"ss-c-v2-r{expected_revision}")
+        self.assertRegex(job_slug, r"^ss-j-v2-r[0-9a-f]{20}$")
+        self.assertEqual(observer_slug, job_slug.replace("ss-j-", "ss-o-", 1))
+        job_obj = objects[job_slug]
+        observer = objects[observer_slug]
         job = _manifest(job_obj)
         observed = _manifest(observer)
         self.assertIn(MARKER, job["metadata"]["name"])
         self.assertEqual(observed["metadata"], job["metadata"])
         # Marker changes are mandatory whenever the embedded script/template changes.
-        self.assertEqual(job_obj["metadata"]["annotations"]["krm.kcl.dev/composition-resource-name"], f"ss-j-{MARKER}-g1")
+        self.assertEqual(job_obj["metadata"]["annotations"]["krm.kcl.dev/composition-resource-name"], job_slug)
 
     def test_job_security_and_secret_file_mount_contract(self):
         obj, job, container, script = _job_and_script(_render())
@@ -279,8 +323,9 @@ class RenderContractTest(unittest.TestCase):
             {"name": "web", "image": "x", "port": 9090, "build": {"enabled": True, "context": "."}},
             {"name": "api", "image": "x", "port": 8080, "build": {"enabled": True, "context": "services/api"}},
         ]
-        objects = _objects(_render(services))
-        config = _manifest(objects[f"ss-c-{MARKER}-g1"])
+        items = _render(services)
+        objects = _objects(items)
+        config = _manifest(objects[_scaffold_slug(items, "c")])
         lines = [json.loads(line) for line in config["data"]["files.jsonl"].splitlines()]
         self.assertEqual([x["path"] for x in lines], ["Dockerfile", "services/api/Dockerfile"])
         for record, port in zip(lines, (9090, 8080)):
@@ -307,7 +352,8 @@ class RenderContractTest(unittest.TestCase):
         self.assertNotIn("gitea-cicd", slugs)
 
     def test_observer_is_observe_only_and_complete_true_is_the_only_ready_state(self):
-        observer = _objects(_render())[f"ss-o-{MARKER}-g1"]
+        items = _render()
+        observer = _objects(items)[_scaffold_slug(items, "o")]
         self.assertEqual(observer["spec"]["managementPolicies"], ["Observe"])
         readiness = observer["spec"]["readiness"]
         self.assertEqual(readiness["policy"], "DeriveFromCelQuery")
@@ -413,7 +459,7 @@ class ExecutableBehaviorTest(unittest.TestCase):
         ])
         objects = _objects(items)
         cls.script = _job_and_script(items)[3]
-        cls.jsonl = _manifest(objects[f"ss-c-{MARKER}-g1"])["data"]["files.jsonl"]
+        cls.jsonl = _manifest(objects[_scaffold_slug(items, "c")])["data"]["files.jsonl"]
 
     def run_script(self, fake, token=TEST_TOKEN):
         with tempfile.TemporaryDirectory() as td:

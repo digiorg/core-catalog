@@ -1204,13 +1204,16 @@ spec:
             giteaRepoBody = safeJsonObject(giteaRepoResponse.body) if giteaRepoResponseOk else {}
             giteaRepoReady = giteaRepoResponseOk and asStr(giteaRepoBody?.full_name) == "DigiOrg/${appName}"
 
-            # Issue #301 fresh-source scaffold identity has two independent parts:
-            # v1 is the script/template contract; OXR generation is the spec version.
-            # Status-only reconciles retain generation and therefore retain the Job.
-            sourceScaffoldContract = "v1"
-            sourceScaffoldGeneration = oxr.metadata?.generation
-            sourceScaffoldGenerationValid = typeof(sourceScaffoldGeneration) == "int" and sourceScaffoldGeneration > 0
-            sourceScaffoldIdentity = "${sourceScaffoldContract}-g${sourceScaffoldGeneration}" if sourceScaffoldGenerationValid else ""
+            # Issue #301 fresh-source scaffold identity must not depend on OXR
+            # metadata.generation. Crossplane atomically replaces spec.resourceRefs
+            # before applying composed resources; a generation-derived composed
+            # resource name therefore changes resourceRefs, increments generation,
+            # and can never become the current ready ConfigMap. Bind identity to the
+            # exact scaffold payload instead. The explicit contract marker changes
+            # whenever the script/template lifecycle changes, while the payload hash
+            # changes for Dockerfile-relevant service inputs without reacting to
+            # controller-owned resourceRefs churn.
+            sourceScaffoldContract = "v2"
             scaffoldBaseImage = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
             scaffoldCurlImage = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
             buildContextFor = lambda svc: any -> str {
@@ -1241,9 +1244,15 @@ spec:
             # XRD-safe contexts make lexical ordering deterministic and shell inert.
             scaffoldFiles = [scaffoldFileFor(svc) for svc in buildableServices]
             scaffoldFilesJsonl = "\n".join([json.encode(entry) for entry in scaffoldFiles]) + "\n"
+            # Twenty hex characters retain 80 bits of SHA-256 while keeping the
+            # longest allowed 32-character appName plus scaffold suffix below the
+            # Kubernetes 63-character DNS-label limit.
+            sourceScaffoldRevision = crypto.sha256(scaffoldFilesJsonl)[0:20]
+            sourceScaffoldIdentity = "${sourceScaffoldContract}-r${sourceScaffoldRevision}"
+            sourceScaffoldIdentityValid = regex.match(sourceScaffoldIdentity, r'^v2-r[0-9a-f]{20}$')
             # Keep both provider-kubernetes Object names and inner Job/ConfigMap
             # names within Kubernetes' 63-character DNS-label limit even for the
-            # XRD's maximum 32-character appName plus an int64 generation.
+            # XRD's maximum 32-character appName.
             scaffoldJobName = "${appName}-ss-${sourceScaffoldIdentity}"
 
             # POSIX sh; behavior is executed against a fake Gitea server in tests.
@@ -1409,12 +1418,12 @@ spec:
                 celQuery = "object.status.conditions.exists(c, c.type == \"Complete\" && c.status == \"True\") && !object.status.conditions.exists(c, c.type == \"Failed\" && c.status == \"True\")"
             }
             sourceScaffoldRequired = giteaCicd and len(buildableServices) > 0
-            sourceScaffoldConfigReady = isReadyConditionTrue(ocds["ss-c-${sourceScaffoldIdentity}"]) if sourceScaffoldGenerationValid else False
-            sourceScaffoldConfigItems = [sourceScaffoldConfigObj] if (sourceScaffoldRequired and sourceScaffoldGenerationValid and scaffoldContextsUnambiguous and giteaRepoReady) else []
+            sourceScaffoldConfigReady = isReadyConditionTrue(ocds["ss-c-${sourceScaffoldIdentity}"]) if sourceScaffoldIdentityValid else False
+            sourceScaffoldConfigItems = [sourceScaffoldConfigObj] if (sourceScaffoldRequired and sourceScaffoldIdentityValid and scaffoldContextsUnambiguous and giteaRepoReady) else []
             sourceScaffoldExecutionItems = [sourceScaffoldJobObj, _sourceScaffoldObserverObj] if (len(sourceScaffoldConfigItems) == 1 and sourceScaffoldConfigReady) else []
             sourceScaffoldItems = sourceScaffoldConfigItems + sourceScaffoldExecutionItems
-            scaffoldObserverConditions = asList(ocds["ss-o-${sourceScaffoldIdentity}"]?.Resource?.status?.conditions) if sourceScaffoldGenerationValid else []
-            sourceScaffoldObservedReady = sourceScaffoldGenerationValid and scaffoldContextsUnambiguous and len([
+            scaffoldObserverConditions = asList(ocds["ss-o-${sourceScaffoldIdentity}"]?.Resource?.status?.conditions) if sourceScaffoldIdentityValid else []
+            sourceScaffoldObservedReady = sourceScaffoldIdentityValid and scaffoldContextsUnambiguous and len([
                 c for c in scaffoldObserverConditions
                 if asStr(asDict(c)?.type) == "Ready" and asStr(asDict(c)?.status) == "True"
             ]) == 1

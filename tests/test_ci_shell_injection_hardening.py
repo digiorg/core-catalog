@@ -39,27 +39,18 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
+from render_harness import (  # noqa: E402
+    by_kind,
+    make_oxr,
+    ready_cicd_context,
+    render_with_ready_scaffold,
+)
 
 
 def _ci_workflow_text(services, **oxr_kwargs):
     app_name = oxr_kwargs.pop("appName", "shellinj")
     ready = ready_cicd_context(app_name)
-    buildable_count = sum(
-        1 for svc in services if svc.get("build", {}).get("enabled", False)
-    )
-    for i in range(buildable_count):
-        ready["ocds"][f"source-scaffold-{i}"] = {
-            "Resource": {
-                "status": {
-                    "response": {
-                        "statusCode": 200,
-                        "body": json.dumps({"type": "file", "content": "dXNlciBzb3VyY2U="}),
-                    }
-                }
-            }
-        }
-    items = render(
+    items = render_with_ready_scaffold(
         {
             "oxr": make_oxr(
                 appName=app_name,
@@ -162,7 +153,7 @@ class ServiceNameCannotBecomeShellSyntaxTest(unittest.TestCase):
         for payload in NAME_INJECTION_PAYLOADS:
             with self.subTest(payload=payload):
                 ready = ready_cicd_context("shellinj")
-                items = render(
+                items = render_with_ready_scaffold(
                     {
                         "oxr": make_oxr(
                             appName="shellinj",

@@ -25,6 +25,7 @@ instant and offline. Set KCL_CLI_BIN to point at an already-installed `kcl`/
 """
 
 import base64
+import copy
 import json
 import os
 import platform
@@ -111,12 +112,6 @@ def ready_cicd_context(app_name, robot_id=42, robot_name=None, robot_secret=b"cr
             },
             "gitea-secret-harbor-robot-name": secret_observation("HARBOR_ROBOT_NAME"),
             "gitea-secret-harbor-robot-secret": secret_observation("HARBOR_ROBOT_SECRET"),
-            "ss-c-v1-g1": {
-                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
-            },
-            "ss-o-v1-g1": {
-                "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
-            },
         },
         "requiredResources": {
             "targetNamespace": active_namespace_requirement(app_name),
@@ -345,6 +340,61 @@ def render(params, composition_path=PIPELINE_COMPOSITION):
             raise KclRenderError(proc)
         out = yaml.safe_load(proc.stdout) or {}
         return out.get("items", [])
+
+
+def render_with_ready_scaffold(params, composition_path=PIPELINE_COMPOSITION):
+    """Render the three reconciles required for a completed source scaffold.
+
+    The scaffold identity is product output derived from its exact payload, so tests
+    must discover it from the first render rather than duplicate the hash algorithm.
+    Synthetic Ready observations then model provider-kubernetes after each apply.
+    """
+    converging = copy.deepcopy(params)
+    ocds = converging.setdefault("ocds", {})
+    buildable = [
+        svc
+        for svc in converging.get("oxr", {}).get("spec", {}).get("services", [])
+        if svc.get("build", {}).get("enabled", False)
+    ]
+    if not buildable:
+        return render(converging, composition_path)
+
+    initial = render(converging, composition_path)
+    config_slugs = sorted(
+        item.get("metadata", {}).get("annotations", {}).get(
+            "krm.kcl.dev/composition-resource-name", ""
+        )
+        for item in initial
+        if item.get("metadata", {}).get("annotations", {}).get(
+            "krm.kcl.dev/composition-resource-name", ""
+        ).startswith("ss-c-v2-r")
+    )
+    if len(config_slugs) != 1:
+        raise AssertionError(
+            "expected exactly one current scaffold ConfigMap, got %r" % config_slugs
+        )
+    ocds[config_slugs[0]] = {
+        "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    }
+
+    config_ready = render(converging, composition_path)
+    observer_slugs = sorted(
+        item.get("metadata", {}).get("annotations", {}).get(
+            "krm.kcl.dev/composition-resource-name", ""
+        )
+        for item in config_ready
+        if item.get("metadata", {}).get("annotations", {}).get(
+            "krm.kcl.dev/composition-resource-name", ""
+        ).startswith("ss-o-v2-r")
+    )
+    if len(observer_slugs) != 1:
+        raise AssertionError(
+            "expected exactly one current scaffold observer, got %r" % observer_slugs
+        )
+    ocds[observer_slugs[0]] = {
+        "Resource": {"status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+    }
+    return render(converging, composition_path)
 
 
 def make_oxr(
