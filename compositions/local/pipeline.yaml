@@ -1018,22 +1018,35 @@ spec:
                 })
             }
 
+            # Local applications share the platform's existing digiorg.local
+            # HTTPS virtual host instead of creating per-service subdomains whose
+            # certificates and host resolution would need separate lifecycle
+            # management. The external /<app>-<service> prefix is stripped before
+            # proxying so ordinary root-based application APIs keep working.
+            # TLS remains owned centrally by core's ingress-nginx/digiorg.local
+            # Ingress; a namespaced application Ingress must not reference that
+            # cross-namespace TLS Secret.
             ingressFor = lambda svc: any -> any {
                 k8sObject("service-${svc.name}-ingress", {
                     apiVersion = "networking.k8s.io/v1"
                     kind = "Ingress"
                     metadata.name = "${svc.name}-ingress"
                     metadata.namespace = appName
-                    metadata.annotations = {"nginx.ingress.kubernetes.io/rewrite-target" = "/"}
+                    metadata.annotations = {
+                        "nginx.ingress.kubernetes.io/use-regex" = "true"
+                        "nginx.ingress.kubernetes.io/rewrite-target" = "/$2"
+                        "nginx.ingress.kubernetes.io/ssl-redirect" = "true"
+                        "nginx.ingress.kubernetes.io/force-ssl-redirect" = "true"
+                    }
                     spec = {
                         ingressClassName = "nginx"
                         rules = [
                             {
-                                host = "${appName}-${svc.name}.digiorg.local"
+                                host = "digiorg.local"
                                 http.paths = [
                                     {
-                                        path = "/"
-                                        pathType = "Prefix"
+                                        path = "/${appName}-${svc.name}(/|$)(.*)"
+                                        pathType = "ImplementationSpecific"
                                         backend.service = {name = "${svc.name}-svc", port.number = 80}
                                     }
                                 ]

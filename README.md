@@ -61,7 +61,7 @@ What the KCL script actually renders, per `AppClaim`/`Application` field:
 |---|---|
 | *(always)* | `Namespace`, `ServiceAccount`, `Role`, `RoleBinding`, `NetworkPolicy` for `spec.appName` |
 | `spec.database.enabled` | Requests `RequiredResources` for the CNPG CRD (`clusters.postgresql.cnpg.io`) and `ValidatingWebhookConfiguration` (`cnpg-validating-webhook-configuration`). If **not** both present, renders **no** `Cluster` and sets a `DatabaseReady=False` Condition (`CnpgPrerequisiteNotReady`) on the composite **and** claim naming the exact prerequisite (`nu scripts/local-setup.nu future-infra`). Only creates the CNPG `Cluster` once both are confirmed present — never coupled to the internal platform database. |
-| `spec.services[]` | Renders a `Deployment` + `Service` + `Ingress` for **every** entry (not index 0 only). For a `build.enabled: true` service, the `Deployment` is withheld entirely until an image is actually promoted (see the automatic image promotion row below) — `spec.services[].image` is never used for such a service, even as a placeholder. |
+| `spec.services[]` | Renders a `Deployment` + `Service` + `Ingress` for **every** entry (not index 0 only). Local application routes share the platform's existing `https://digiorg.local` TLS virtual host at `/<appName>-<serviceName>/`; ingress-nginx strips that external prefix before proxying to the service root. Generated application Ingresses deliberately do not claim a namespaced TLS Secret because Core's central `digiorg.local` Ingress remains the single certificate owner. For a `build.enabled: true` service, the `Deployment` is withheld entirely until an image is actually promoted (see the automatic image promotion row below) — `spec.services[].image` is never used for such a service, even as a placeholder. |
 | `spec.services[].build.enabled` (with `spec.gitea.enabled && spec.gitea.cicd`) | **Safe fresh-source scaffold and automatic immutable image promotion**: after an exact `200` observation confirms the expected `DigiOrg/<appName>` repository identity, a TLS-verified, Secret-file-mounted, hardened one-shot Job creates missing Dockerfiles for the requested build contexts in one create-only batch. Its `v2-r<revision>` identity uses an 80-bit SHA-256 prefix of the exact canonical scaffold payload: Crossplane-owned `spec.resourceRefs` updates and XR generation changes cannot rotate it, while any Dockerfile-relevant context, port, base-image, or scaffold-contract change creates a new revision. Existing source is preserved byte-for-byte, unsafe or malformed responses fail closed, and the workflow is withheld until an Observe-only Job gate confirms completion. The pipeline then observes Gitea's main branch HEAD and matching Harbor artifacts, pins Deployments to immutable digests, and preserves the previous promoted digest while a newer build is pending. Pulls use a separate pull-only Harbor robot and a least-privilege Secret synchronization path. |
 | `spec.messaging.enabled` + `spec.messaging.subjects[]` | Renders a managed NATS JetStream `Stream` + `Consumer` (`jetstream.nats.io/v1beta2`, via the NACK controller — `core/apps/platform/nats-jetstream-controller.yaml`) for **every** subject, plus a `NATS_URL`/`NATS_SUBJECTS` ConfigMap |
 | `spec.gitea.enabled` | Creates the Gitea source repository (`provider-http` `Request`, least-privilege token via `{{ crossplane-gitea-credentials:crossplane-system:token }}` secret placeholder — never a literal credential) with the requested `spec.gitea.visibility` |
@@ -111,7 +111,9 @@ python3 -m unittest discover -s tests -p 'test_*.py' -v
 Coverage: base resources always present; database enabled/disabled and the
 CNPG fail-closed gate (missing prerequisite, partial prerequisite, ready);
 no internal-platform-database coupling; multiple services (no index-0
-truncation); multiple messaging subjects (no index-0 truncation, valid NACK
+truncation); shared-host application subpaths, root/nested-path rewrites,
+central TLS ownership, and distinct routes for multiple services; multiple
+messaging subjects (no index-0 truncation, valid NACK
 identifiers); Gitea visibility (private/public) and `cicd` true/false;
 idempotent observe-before-create mappings for Gitea/Harbor; Harbor robot
 secret injection (never a literal secret); no literal credentials anywhere in
@@ -160,6 +162,13 @@ kubectl apply -k compositions/local/
   matching Harbor artifact and promotes the Deployment's image automatically
   — see the automatic image promotion row above. `spec.services[].image` is
   therefore only meaningful for services that never set `build.enabled: true`.
+
+- The local shared-host Ingress contract transparently rewrites
+  `/<appName>-<serviceName>/...` to `/...` for ordinary root-based APIs.
+  Applications that emit absolute redirects or asset URLs, scope cookies to a
+  specific path, or otherwise need awareness of their external URL prefix must
+  provide native base-path support; proxy rewriting cannot change browser-side
+  routing semantics.
 
 - No Azure/AWS Compositions exist yet (`compositions/aws`, `compositions/azure`
   remain placeholders).
