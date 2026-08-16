@@ -27,6 +27,7 @@ from render_harness import (  # noqa: E402
     manifests_of_kind,
     ready_cicd_context,
     render,
+    render_with_ready_scaffold,
 )
 
 
@@ -34,30 +35,12 @@ def _render_with_ready_cicd(params):
     """Render final workflow state for tests whose subject is workflow content."""
     merged = dict(params)
     ready = ready_cicd_context(params["oxr"]["spec"]["appName"])
-    buildable = [
-        svc
-        for svc in params["oxr"]["spec"].get("services", [])
-        if svc.get("build", {}).get("enabled", False)
-    ]
-    scaffold_observations = {
-        f"source-scaffold-{i}": {
-            "Resource": {
-                "status": {
-                    "response": {
-                        "statusCode": 200,
-                        "body": json.dumps({"type": "file", "content": "dXNlciBzb3VyY2U="}),
-                    }
-                }
-            }
-        }
-        for i in range(len(buildable))
-    }
-    merged["ocds"] = {**ready["ocds"], **scaffold_observations, **params.get("ocds", {})}
+    merged["ocds"] = {**ready["ocds"], **params.get("ocds", {})}
     merged["requiredResources"] = {
         **ready["requiredResources"],
         **params.get("requiredResources", {}),
     }
-    return render(merged)
+    return render_with_ready_scaffold(merged)
 
 
 class BaseAlwaysPresentTest(unittest.TestCase):

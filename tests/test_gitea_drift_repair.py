@@ -28,7 +28,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
+from render_harness import (  # noqa: E402
+    by_kind,
+    make_oxr,
+    ready_cicd_context,
+    render,
+    render_with_ready_scaffold,
+)
 
 
 def _request(slug, appName="driftapp", **kwargs):
@@ -36,7 +42,7 @@ def _request(slug, appName="driftapp", **kwargs):
     params = {"oxr": make_oxr(appName=appName, **kwargs)}
     if slug == "gitea-cicd":
         params.update(ready_cicd_context(appName))
-    items = render(params)
+    items = render_with_ready_scaffold(params) if slug == "gitea-cicd" else render(params)
     return next(
         i
         for i in by_kind(items, "Request")
