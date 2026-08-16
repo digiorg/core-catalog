@@ -1021,7 +1021,9 @@ spec:
             # Local applications share the platform's existing digiorg.local
             # HTTPS virtual host instead of creating per-service subdomains whose
             # certificates and host resolution would need separate lifecycle
-            # management. The external /<app>-<service> prefix is stripped before
+            # management. The external /apps/<app>/<service> prefix uses separate
+            # validated name segments, avoiding collisions when either name contains
+            # hyphens, and is stripped before
             # proxying so ordinary root-based application APIs keep working.
             # TLS remains owned centrally by core's ingress-nginx/digiorg.local
             # Ingress; a namespaced application Ingress must not reference that
@@ -1045,7 +1047,7 @@ spec:
                                 host = "digiorg.local"
                                 http.paths = [
                                     {
-                                        path = "/${appName}-${svc.name}(/|$)(.*)"
+                                        path = "/apps/${appName}/${svc.name}(/|$)(.*)"
                                         pathType = "ImplementationSpecific"
                                         backend.service = {name = "${svc.name}-svc", port.number = 80}
                                     }

@@ -68,7 +68,7 @@ class SharedHostSubpathIngressTest(unittest.TestCase):
         self.assertEqual(self.rule["host"], PLATFORM_HOST)
 
     def test_routes_under_the_deterministic_app_service_subpath(self):
-        self.assertEqual(self.path["path"], "/myapp-myappapi(/|$)(.*)")
+        self.assertEqual(self.path["path"], "/apps/myapp/myappapi(/|$)(.*)")
         self.assertEqual(self.path["pathType"], "ImplementationSpecific")
         self.assertEqual(
             self.path["backend"]["service"],
@@ -91,10 +91,10 @@ class SharedHostSubpathIngressTest(unittest.TestCase):
             self.assertIsNotNone(match, request_path)
             return rewrite.replace("$2", match.group(2))
 
-        self.assertEqual(backend_path("/myapp-myappapi"), "/")
-        self.assertEqual(backend_path("/myapp-myappapi/"), "/")
-        self.assertEqual(backend_path("/myapp-myappapi/health"), "/health")
-        self.assertEqual(backend_path("/myapp-myappapi/api/v1/items"), "/api/v1/items")
+        self.assertEqual(backend_path("/apps/myapp/myappapi"), "/")
+        self.assertEqual(backend_path("/apps/myapp/myappapi/"), "/")
+        self.assertEqual(backend_path("/apps/myapp/myappapi/health"), "/health")
+        self.assertEqual(backend_path("/apps/myapp/myappapi/api/v1/items"), "/api/v1/items")
 
     def test_does_not_claim_a_namespaced_tls_secret(self):
         self.assertNotIn(
@@ -106,7 +106,38 @@ class SharedHostSubpathIngressTest(unittest.TestCase):
     def test_route_does_not_overlap_reserved_platform_root_paths(self):
         route_prefix = self.path["path"].split("(", 1)[0]
         self.assertNotIn(route_prefix, RESERVED_PLATFORM_ROOT_PATHS)
-        self.assertTrue(route_prefix.startswith("/myapp-"))
+        self.assertTrue(route_prefix.startswith("/apps/myapp/"))
+
+
+class CrossAppRouteCollisionTest(unittest.TestCase):
+    def test_hyphenated_app_and_service_names_cannot_share_a_global_route(self):
+        cases = [
+            ("foo", "bar-baz", "/apps/foo/bar-baz(/|$)(.*)"),
+            ("foo-bar", "baz", "/apps/foo-bar/baz(/|$)(.*)"),
+        ]
+        routes = []
+        for app_name, service_name, expected_path in cases:
+            items = render(
+                {
+                    "oxr": make_oxr(
+                        appName=app_name,
+                        services=[
+                            {
+                                "name": service_name,
+                                "image": "example/%s:1" % service_name,
+                                "port": 8080,
+                            }
+                        ],
+                    )
+                }
+            )
+            ingress = _ingress_by_name(items, "%s-ingress" % service_name)
+            rule, path = _route(ingress)
+            self.assertEqual(rule["host"], PLATFORM_HOST)
+            self.assertEqual(path["path"], expected_path)
+            routes.append(path["path"])
+
+        self.assertEqual(len(routes), len(set(routes)))
 
 
 class MultiServiceSharedHostPathTest(unittest.TestCase):
@@ -132,9 +163,9 @@ class MultiServiceSharedHostPathTest(unittest.TestCase):
         self.assertEqual(
             sorted(routes),
             [
-                "/multiapp-api(/|$)(.*)",
-                "/multiapp-metrics(/|$)(.*)",
-                "/multiapp-worker(/|$)(.*)",
+                "/apps/multiapp/api(/|$)(.*)",
+                "/apps/multiapp/metrics(/|$)(.*)",
+                "/apps/multiapp/worker(/|$)(.*)",
             ],
         )
         self.assertEqual(len(routes), len(set(routes)))
