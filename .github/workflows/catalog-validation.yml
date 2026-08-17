@@ -20,6 +20,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r .github/requirements-catalog-validation-py312-linux.txt
+
       - name: Verify Docker runtime prerequisite
         run: docker version
 

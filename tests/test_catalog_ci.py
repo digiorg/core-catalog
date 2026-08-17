@@ -8,6 +8,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "catalog-validation.yml"
+REQUIREMENTS = ROOT / ".github" / "requirements-catalog-validation-py312-linux.txt"
 
 
 class CatalogValidationWorkflowTest(unittest.TestCase):
@@ -37,6 +38,21 @@ class CatalogValidationWorkflowTest(unittest.TestCase):
         )
         self.assertNotIn("SCAFFOLD_RUNTIME_TEST", text)
         self.assertNotRegex(text, r"(?i)continue-on-error:\s*true")
+
+    def test_python_dependencies_are_version_and_hash_pinned(self):
+        text = self.workflow()
+        self.assertIn(
+            "pip install --disable-pip-version-check --only-binary=:all: "
+            "--require-hashes -r "
+            ".github/requirements-catalog-validation-py312-linux.txt",
+            text,
+        )
+        self.assertTrue(REQUIREMENTS.is_file(), f"missing requirements: {REQUIREMENTS}")
+        requirements = REQUIREMENTS.read_text(encoding="utf-8")
+        self.assertRegex(
+            requirements,
+            r"(?m)^PyYAML==6\.0\.3 --hash=sha256:[0-9a-f]{64}$",
+        )
 
     def test_kustomize_is_checksum_verified_and_rendered(self):
         text = self.workflow()
