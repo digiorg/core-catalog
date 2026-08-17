@@ -1,0 +1,49 @@
+# Validates the exact rendered Catalog contracts, including the generated
+# digest-pinned NGINX scaffold image, on every push and pull request.
+name: catalog-validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-render-and-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install --disable-pip-version-check --only-binary=:all: --require-hashes -r .github/requirements-catalog-validation-py312-linux.txt
+
+      - name: Verify Docker runtime prerequisite
+        run: docker version
+
+      - name: Run complete Catalog contract and runtime suite
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Install kustomize
+        run: |
+          set -euo pipefail
+          KUSTOMIZE_VERSION=v5.8.1
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" -o /tmp/kustomize.tgz
+          echo '029a7f0f4e1932c52a0476cf02a0fd855c0bb85694b82c338fc648dcb53a819d  /tmp/kustomize.tgz' | sha256sum -c -
+          tar -xzf /tmp/kustomize.tgz -C /tmp
+          sudo install -m 0755 /tmp/kustomize /usr/local/bin/kustomize
+
+      - name: Render Catalog and check diff hygiene
+        run: |
+          set -euo pipefail
+          kustomize build compositions/local >/tmp/core-catalog-render.yaml
+          test -s /tmp/core-catalog-render.yaml
+          git diff --check

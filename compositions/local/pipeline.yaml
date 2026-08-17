@@ -1228,7 +1228,7 @@ spec:
             # whenever the script/template lifecycle changes, while the payload hash
             # changes for Dockerfile-relevant service inputs without reacting to
             # controller-owned resourceRefs churn.
-            sourceScaffoldContract = "v2"
+            sourceScaffoldContract = "v3"
             scaffoldBaseImage = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
             scaffoldCurlImage = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
             buildContextFor = lambda svc: any -> str {
@@ -1244,7 +1244,7 @@ spec:
 
             scaffoldDockerfileFor = lambda svc: any -> str {
                 port = svc.port
-                "FROM ${scaffoldBaseImage}\nRUN printf '%s\\n' 'server {' '    listen ${port};' '    location / {' '        default_type text/plain;' '        return 200 DigiOrg - ${appName};' '    }' '}' > /etc/nginx/conf.d/default.conf\nEXPOSE ${port}\n"
+                "FROM ${scaffoldBaseImage}\nRUN printf '%s\\n' 'server {' '    listen ${port};' '    location / {' '        default_type text/plain;' '        return 200 \"DigiOrg - ${appName}\";' '    }' '}' > /etc/nginx/conf.d/default.conf\nEXPOSE ${port}\n"
             }
 
             scaffoldFileFor = lambda svc: any -> {str:str} {
@@ -1264,7 +1264,7 @@ spec:
             # Kubernetes 63-character DNS-label limit.
             sourceScaffoldRevision = crypto.sha256(scaffoldFilesJsonl)[0:20]
             sourceScaffoldIdentity = "${sourceScaffoldContract}-r${sourceScaffoldRevision}"
-            sourceScaffoldIdentityValid = regex.match(sourceScaffoldIdentity, r'^v2-r[0-9a-f]{20}$')
+            sourceScaffoldIdentityValid = regex.match(sourceScaffoldIdentity, r'^v3-r[0-9a-f]{20}$')
             # Keep both provider-kubernetes Object names and inner Job/ConfigMap
             # names within Kubernetes' 63-character DNS-label limit even for the
             # XRD's maximum 32-character appName.

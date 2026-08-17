@@ -367,7 +367,7 @@ def render_with_ready_scaffold(params, composition_path=PIPELINE_COMPOSITION):
         for item in initial
         if item.get("metadata", {}).get("annotations", {}).get(
             "krm.kcl.dev/composition-resource-name", ""
-        ).startswith("ss-c-v2-r")
+        ).startswith("ss-c-v3-r")
     )
     if len(config_slugs) != 1:
         raise AssertionError(
@@ -385,7 +385,7 @@ def render_with_ready_scaffold(params, composition_path=PIPELINE_COMPOSITION):
         for item in config_ready
         if item.get("metadata", {}).get("annotations", {}).get(
             "krm.kcl.dev/composition-resource-name", ""
-        ).startswith("ss-o-v2-r")
+        ).startswith("ss-o-v3-r")
     )
     if len(observer_slugs) != 1:
         raise AssertionError(

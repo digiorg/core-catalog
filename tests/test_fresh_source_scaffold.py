@@ -17,7 +17,7 @@ from urllib.parse import unquote, urlsplit
 sys.path.insert(0, os.path.dirname(__file__))
 from render_harness import by_kind, make_oxr, ready_cicd_context, render  # noqa: E402
 
-MARKER = "v2"
+MARKER = "v3"
 NGINX = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
 CURL_IMAGE = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
 TEST_TOKEN = 'tok en;$`"\\sentinel'
@@ -125,9 +125,20 @@ def _dockerfile(items, path="Dockerfile"):
 
 
 class RenderContractTest(unittest.TestCase):
+    def test_scaffold_contract_marker_is_v3_and_v2_is_superseded(self):
+        slugs = {
+            _slug(item) for item in _render()
+            if (_slug(item) or "").startswith("ss-c-")
+        }
+        self.assertEqual(len(slugs), 1)
+        slug = next(iter(slugs))
+        self.assertRegex(slug, r"^ss-c-v3-r[0-9a-f]{20}$")
+        self.assertNotIn("-v2-r", slug)
+
     def test_root_dockerfile_returns_the_app_name(self):
         dockerfile = _dockerfile(_render(app="alpha-app"))
-        self.assertIn("        return 200 DigiOrg - alpha-app;", dockerfile)
+        self.assertIn('        return 200 "DigiOrg - alpha-app";', dockerfile)
+        self.assertNotIn("        return 200 DigiOrg - alpha-app;", dockerfile)
         self.assertEqual(dockerfile.count("return 200 "), 1)
 
     def test_app_name_changes_only_the_generated_response_and_revision(self):
@@ -152,7 +163,7 @@ class RenderContractTest(unittest.TestCase):
              "build": {"enabled": True, "context": "."}},
         ]
         dockerfile = _dockerfile(_render(services=services, app="alpha-app"))
-        self.assertIn("return 200 DigiOrg - alpha-app;", dockerfile)
+        self.assertIn('return 200 "DigiOrg - alpha-app";', dockerfile)
         self.assertNotIn("DigiOrg - alpha-service", dockerfile)
 
     def test_maximum_hyphenated_app_name_is_safe_in_printf_argument(self):
@@ -160,7 +171,7 @@ class RenderContractTest(unittest.TestCase):
         self.assertEqual(len(app), 32)
         self.assertIsNotNone(APP_NAME_ADMISSION_PATTERN.fullmatch(app))
         dockerfile = _dockerfile(_render(app=app))
-        self.assertIn(f"'        return 200 DigiOrg - {app};'", dockerfile)
+        self.assertIn(f"'        return 200 \"DigiOrg - {app}\";'", dockerfile)
         self.assertNotIn("\\'", app)
 
     def test_app_name_admission_contract_excludes_shell_breaking_characters(self):
@@ -239,7 +250,7 @@ class RenderContractTest(unittest.TestCase):
         items = render(params)
         scaffold_objects = [
             item for item in by_kind(items, "Object")
-            if ("-v2-r" in (_slug(item) or ""))
+            if (f"-{MARKER}-r" in (_slug(item) or ""))
         ]
         self.assertEqual(len(scaffold_objects), 3)
         for item in scaffold_objects:
@@ -325,7 +336,7 @@ class RenderContractTest(unittest.TestCase):
         scaffold_http = [x for x in by_kind(items, "Request") if "source-scaffold" in (_slug(x) or "")]
         self.assertEqual(scaffold_http, [])
 
-    def test_job_and_observer_have_explicit_v2_marker_and_exact_revision(self):
+    def test_job_and_observer_have_explicit_v3_marker_and_exact_revision(self):
         items = _render()
         objects = _objects(items)
         config_slug = _scaffold_slug(items, "c")
@@ -333,8 +344,8 @@ class RenderContractTest(unittest.TestCase):
         observer_slug = _scaffold_slug(items, "o")
         files_jsonl = _manifest(objects[config_slug])["data"]["files.jsonl"]
         expected_revision = hashlib.sha256(files_jsonl.encode()).hexdigest()[:20]
-        self.assertEqual(config_slug, f"ss-c-v2-r{expected_revision}")
-        self.assertRegex(job_slug, r"^ss-j-v2-r[0-9a-f]{20}$")
+        self.assertEqual(config_slug, f"ss-c-v3-r{expected_revision}")
+        self.assertRegex(job_slug, r"^ss-j-v3-r[0-9a-f]{20}$")
         self.assertEqual(observer_slug, job_slug.replace("ss-j-", "ss-o-", 1))
         job_obj = objects[job_slug]
         observer = objects[observer_slug]
