@@ -1244,7 +1244,7 @@ spec:
 
             scaffoldDockerfileFor = lambda svc: any -> str {
                 port = svc.port
-                "FROM ${scaffoldBaseImage}\nRUN printf '%s\\n' 'server {' '    listen ${port};' '    location / {' '        default_type text/plain;' '        return 200 DigiOrg;' '    }' '}' > /etc/nginx/conf.d/default.conf\nEXPOSE ${port}\n"
+                "FROM ${scaffoldBaseImage}\nRUN printf '%s\\n' 'server {' '    listen ${port};' '    location / {' '        default_type text/plain;' '        return 200 DigiOrg - ${appName};' '    }' '}' > /etc/nginx/conf.d/default.conf\nEXPOSE ${port}\n"
             }
 
             scaffoldFileFor = lambda svc: any -> {str:str} {

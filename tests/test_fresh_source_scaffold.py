@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 
 import subprocess
 import sys
@@ -20,21 +21,25 @@ MARKER = "v2"
 NGINX = "nginx:1.30-alpine@sha256:ec664813a30459a8e7176315268a623f6b31abc370eeac51c7de81cd4ec4d451"
 CURL_IMAGE = "curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
 TEST_TOKEN = 'tok en;$`"\\sentinel'
+# Owned by Core's crossplane/xrds/application.yaml. Keep the Catalog consumer
+# contract explicit here because this repository intentionally contains only the
+# Composition, not the XRD that admits AppClaims.
+APP_NAME_ADMISSION_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 
 def _condition(status="True", cond_type="Ready"):
     return {"Resource": {"status": {"conditions": [{"type": cond_type, "status": status}]}}}
 
 
-def _repo_response(status=200, body=None):
+def _repo_response(status=200, body=None, app="myapp"):
     if body is None:
-        body = {"full_name": "DigiOrg/myapp", "name": "myapp", "owner": {"login": "DigiOrg"}}
+        body = {"full_name": f"DigiOrg/{app}", "name": app, "owner": {"login": "DigiOrg"}}
     return {"Resource": {"status": {"response": {"statusCode": status, "body": json.dumps(body)}}}}
 
 
 def _render(services=None, observer=None, credentials_ready=True, gitea=None,
-            repo_observation="ready", generation=1, extra_ocds=None):
-    app = "myapp"
+            repo_observation="ready", generation=1, extra_ocds=None,
+            app="myapp"):
     services = services if services is not None else [
         {"name": "web", "image": "unused", "port": 8080,
          "build": {"enabled": True, "context": "."}}
@@ -42,7 +47,7 @@ def _render(services=None, observer=None, credentials_ready=True, gitea=None,
     ready = ready_cicd_context(app)
     ready["ocds"].pop("source-scaffold-0", None)
     if repo_observation == "ready":
-        ready["ocds"]["gitea-repo"] = _repo_response()
+        ready["ocds"]["gitea-repo"] = _repo_response(app=app)
     elif repo_observation is None:
         ready["ocds"].pop("gitea-repo", None)
     else:
@@ -108,7 +113,65 @@ def _job_and_script(items):
     return job_obj, job, container, container["args"][0]
 
 
+def _scaffold_records(items):
+    objects = _objects(items)
+    config = _manifest(objects[_scaffold_slug(items, "c")])
+    return [json.loads(line) for line in config["data"]["files.jsonl"].splitlines()]
+
+
+def _dockerfile(items, path="Dockerfile"):
+    record = next(item for item in _scaffold_records(items) if item["path"] == path)
+    return base64.b64decode(record["content"]).decode()
+
+
 class RenderContractTest(unittest.TestCase):
+    def test_root_dockerfile_returns_the_app_name(self):
+        dockerfile = _dockerfile(_render(app="alpha-app"))
+        self.assertIn("        return 200 DigiOrg - alpha-app;", dockerfile)
+        self.assertEqual(dockerfile.count("return 200 "), 1)
+
+    def test_app_name_changes_only_the_generated_response_and_revision(self):
+        alpha_items = _render(app="alpha-app")
+        beta_items = _render(app="beta-app")
+        alpha = _dockerfile(alpha_items)
+        beta = _dockerfile(beta_items)
+
+        self.assertEqual(
+            alpha.replace("DigiOrg - alpha-app", "DigiOrg - beta-app"),
+            beta,
+        )
+        self.assertNotEqual(alpha.encode(), beta.encode())
+        self.assertNotEqual(
+            _scaffold_slug(alpha_items, "c"),
+            _scaffold_slug(beta_items, "c"),
+        )
+
+    def test_response_uses_app_name_not_service_name(self):
+        services = [
+            {"name": "alpha-service", "image": "unused", "port": 8080,
+             "build": {"enabled": True, "context": "."}},
+        ]
+        dockerfile = _dockerfile(_render(services=services, app="alpha-app"))
+        self.assertIn("return 200 DigiOrg - alpha-app;", dockerfile)
+        self.assertNotIn("DigiOrg - alpha-service", dockerfile)
+
+    def test_maximum_hyphenated_app_name_is_safe_in_printf_argument(self):
+        app = "a" * 15 + "-" + "b" * 16
+        self.assertEqual(len(app), 32)
+        self.assertIsNotNone(APP_NAME_ADMISSION_PATTERN.fullmatch(app))
+        dockerfile = _dockerfile(_render(app=app))
+        self.assertIn(f"'        return 200 DigiOrg - {app};'", dockerfile)
+        self.assertNotIn("\\'", app)
+
+    def test_app_name_admission_contract_excludes_shell_breaking_characters(self):
+        for unsafe in (
+            "Alpha", "alpha_app", "alpha.app", "alpha/app", "alpha app",
+            "alpha'app", 'alpha"app', "alpha$app", "alpha;app", "-alpha",
+            "a" * 33,
+        ):
+            with self.subTest(unsafe=unsafe):
+                self.assertIsNone(APP_NAME_ADMISSION_PATTERN.fullmatch(unsafe))
+
     def test_resource_ref_generation_bump_does_not_rotate_scaffold_identity(self):
         first = _objects(_render(generation=7))
         bumped = _objects(_render(generation=8))
