@@ -68,6 +68,37 @@ What the KCL script actually renders, per `AppClaim`/`Application` field:
 | `spec.gitea.enabled && spec.gitea.cicd` | Additionally creates a `.gitea/workflows/ci.yaml` Gitea Actions matrix workflow (one job per `spec.services[]` entry with `build.enabled: true`, `actions/checkout` pinned to an immutable commit SHA, each pushing `<harborRegistry>/<appName>/<service name>:<gitea.sha>`; if no service opts in, an honest no-op placeholder job renders instead of a fake image), a least-privilege Harbor project, a project-scoped Harbor robot account (secret captured server-side via `secretInjectionConfigs` into a per-app Secret — the robot secret is never written into the Composition, a manifest, or Git), and pushes that robot's `name`/`secret` into the repository's Gitea Actions secrets `HARBOR_ROBOT_NAME`/`HARBOR_ROBOT_SECRET` (Gitea 1.23 `PUT /repos/{owner}/{repo}/actions/secrets/{secretname}`) so the generated workflow's Harbor login actually resolves |
 | disabled capability | Renders **no** resources for that capability — no silent defaults |
 
+### App-scoped Harbor images and fresh scaffolds
+
+Every build-enabled application gets a Harbor project named `<appName>`, and
+each build-enabled service publishes its image as `<appName>/<serviceName>`.
+The generated workflow pushes a commit-SHA tag, but Deployments consume only
+the corresponding immutable digest-pinned reference:
+
+```text
+digiorg.local/<appName>/<serviceName>@sha256:<digest>
+```
+
+Harbor visibility follows `spec.gitea.visibility` independently for each
+application: `public` creates public project metadata and `private` creates
+private project metadata. A private project can be absent from a nonmember's
+Harbor UI even when it exists and is healthy. Verify project existence through
+the app-scoped declarative `Request` conditions and API identity, together with
+the digest-pinned Deployment image, rather than relying only on the UI project
+list. This Composition does not grant Harbor project membership or weaken
+private-project visibility.
+
+For a newly scaffolded repository, the generated NGINX service responds with:
+
+```text
+DigiOrg - <appName>
+```
+
+Scaffolding remains create-only and commits all missing Dockerfiles atomically.
+Existing repository files are never overwritten, so retained repositories keep
+their current response until changed through their normal reviewed source
+workflow (or recreated during an authoritative fresh reset).
+
 ### Environments
 
 `environments/local.yaml` is a Crossplane `EnvironmentConfig` that provides cluster-specific
