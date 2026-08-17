@@ -25,7 +25,13 @@ class CatalogValidationWorkflowTest(unittest.TestCase):
     def test_actions_are_sha_pinned_and_python_is_312(self):
         text = self.workflow()
         uses = re.findall(r"(?m)^\s*-?\s*uses:\s*([^\s#]+)", text)
-        self.assertGreaterEqual(len(uses), 2)
+        self.assertEqual(
+            uses,
+            [
+                "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+                "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+            ],
+        )
         for action in uses:
             self.assertRegex(action, r"^[^@]+@[0-9a-f]{40}$", action)
         self.assertIn('python-version: "3.12"', text)
