@@ -18,6 +18,50 @@ When a developer creates an `AppClaim`, Crossplane matches it to the single
 Composition in this repo and reconciles the requested resources (namespace,
 RBAC, database, services, Gitea repo/CI, Harbor project/robot, messaging).
 
+## Initial SonarQube enrollment (Core issue #372)
+
+After exact Gitea repository observation, every repository-enabled application
+(including existing claims and `gitea.cicd: false`) gets one private local project
+at `digiorg:gitea:DigiOrg:<appName>`. Multiple services share that project. The
+runner never scans code, binds a Gitea ALM integration, decorates PRs or deletes
+projects/history. It uses the existing Kubernetes provider, not a new controller.
+
+The stable `<appName>-sonarqube-v1` Job in `crossplane-system` has no TTL and no
+Job retries. The Object's CEL checks Complete without Failed; the pipeline emits
+`SonarQubeEnrollmentReady` and withholds overall readiness until enrollment.
+A read-only required Application inventory rejects duplicate or unobserved app
+identity. Completed Jobs remain desired, independent of XR generation and token
+rotation; success is historical enrollment, not continuous drift detection.
+
+`kustomize build compositions/local` includes the versioned runner ConfigMap.
+The pinned non-root Python runner mounts only Secret references:
+`crossplane-sonarqube-credentials/token` and `digiorg-local-ca/ca.crt` in
+`crossplane-system`. It has no Kubernetes service-account token. Core bootstrap
+prepares the dedicated `digiorg-provisioner` credential; never reuse bootstrap
+admin in this runner. Trusted HTTPS, actual API UP, authenticated exact-key
+lookup, Sonar way defaults and final private-project readback are mandatory.
+GETs have three bounded attempts; POST is sent at most once per invocation.
+An ambiguous create is read back but cannot establish ownership by itself.
+
+Any pre-existing or retained project needs Chris's exact-key/current-XR-UID
+approval in operator-managed Secret `crossplane-sonarqube-adoptions`, key
+`approvals.json`. Each entry contains `key`, `xrUID`, `approvedBy: Chris` and
+`approvalRef: https://github.com/digiorg/core/issues/372#issuecomment-<id>`.
+Only the operator writes it after approval and policy verification. The free-text
+`team` field grants no SonarQube access. No mutation overwrites an existing
+project or changes shared policy. Failed Jobs remain for diagnosis; retry/Job
+replacement, account recovery, token rotation and project teardown require an
+operator decision. A retry seeing an existing project also needs explicit adoption.
+
+Accepted prototype authority is not pure create/browse least privilege: global
+Create Projects, inherited global Execute Analysis, and sonar-users project
+Browse, See Source Code, Administer Issues and Administer Security Hotspots.
+Administer System and unrelated rights are excluded. Core verifies the approved
+default template/account policy before issuing or preserving the token. This
+source contract and isolated-image tests do not prove live policy or rollout.
+See Core `specs/372-sonarqube-onboarding/` for sequencing and rollback. Core's
+consumer pin must wait for the reviewed producer's canonical merged commit.
+
 ## Structure
 
 ```

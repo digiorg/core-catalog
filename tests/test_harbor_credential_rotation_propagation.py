@@ -191,7 +191,7 @@ class InPlaceCredentialRepairFingerprintTest(unittest.TestCase):
 
     def test_required_resources_requests_the_exact_app_robot_secret(self):
         items = _render()
-        required = [i for i in items if i.get("kind") == "RequiredResources"]
+        required = [i for i in items if i.get("kind") == "RequiredResources" and "harborRobotCredential" in i.get("requirements", {})]
         self.assertEqual(len(required), 1)
         requirement = required[0]["requirements"]["harborRobotCredential"]
         self.assertEqual(requirement["apiVersion"], "v1")
@@ -280,7 +280,7 @@ class InPlaceCredentialRepairFingerprintTest(unittest.TestCase):
                 )
             }
         )
-        requirements = [i for i in items if i.get("kind") == "RequiredResources"]
+        requirements = [i for i in items if i.get("kind") == "RequiredResources" and "harborRobotCredential" in i.get("requirements", {})]
         self.assertEqual(requirements, [])
 
 

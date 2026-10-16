@@ -5,3 +5,10 @@ resources:
   # competing Compositions (base/database/service/gitea/messaging) that could
   # not be combined for a single AppClaim. See core-catalog/README.md.
   - pipeline.yaml
+configMapGenerator:
+  - name: sonarqube-onboarding-runner-v1
+    namespace: crossplane-system
+    files:
+      - enroll.py=sonarqube/enroll.py
+generatorOptions:
+  disableNameSuffixHash: true
