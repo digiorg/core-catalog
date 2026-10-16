@@ -2097,7 +2097,7 @@ spec:
             })
             _sonarJob.spec.readiness = {
                 policy = "DeriveFromCelQuery"
-                celQuery = "has(object.status.conditions) && object.status.conditions.exists(c, c.type == \"Complete\" && c.status == \"True\") && !object.status.conditions.exists(c, c.type == \"Failed\" && c.status == \"True\")"
+                celQuery = "has(object.status) && has(object.status.conditions) && object.status.conditions.exists(c, c.type == \"Complete\" && c.status == \"True\") && !object.status.conditions.exists(c, c.type == \"Failed\" && c.status == \"True\")"
             }
             sonarInventoryRequest = {
                 apiVersion = "meta.krm.kcl.dev/v1alpha1"

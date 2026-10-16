@@ -72,8 +72,11 @@ class EnrollmentRenderTests(unittest.TestCase):
         self.assertEqual(sonar_jobs(render(p))[0], first)
 
     def test_repo_ready_without_cicd_renders_one_bounded_job(self):
-        jobs = sonar_jobs(render(params()))
+        items = render(params())
+        jobs = sonar_jobs(items)
         self.assertEqual(len(jobs), 1)
+        obj = next(i for i in items if i.get("metadata", {}).get("annotations", {}).get("krm.kcl.dev/composition-resource-name") == "sonarqube-enrollment")
+        self.assertTrue(obj["spec"]["readiness"]["celQuery"].startswith("has(object.status) && "))
         job = jobs[0]
         self.assertEqual(job["spec"]["backoffLimit"], 0)
         self.assertNotIn("ttlSecondsAfterFinished", job["spec"])
