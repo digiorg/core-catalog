@@ -2151,7 +2151,7 @@ spec:
                 {
                     id = id, title = title, type = "timeseries"
                     datasource = prometheusDs
-                    gridPos = {x = 0 if id % 2 == 1 else 12, y = ((id - 1) // 2) * 8, w = 12, h = 8}
+                    gridPos = {x = 0 if id % 2 == 1 else 12, y = (96 + ((id - 16) // 2) * 8) if id >= 16 else ((id - 1) // 2) * 8, w = 12, h = 8}
                     description = "Dedicated app namespace. No series = Unknown/unavailable, not zero. Service ownership is shown separately; resource panels include support Pods. Requests/limits absent = unset/N/A."
                     fieldConfig.defaults = {unit = unit, noValue = "Unknown / unset (N/A)"}
                     targets = [{refId = str(i), expr = expression, legendFormat = "{{pod}} {{container}} {{deployment}} {{reason}}"} for i, expression in exprs]
@@ -2193,6 +2193,10 @@ spec:
                     'max by(namespace,pod,owner_kind,owner_name) (kube_pod_owner{' + appSelector + ',owner_kind="DaemonSet",owner_is_controller="true"})'
                 ], "short")
                 promPanel(11, "Telemetry confidence", ['time() - timestamp(digiorg_app_info{' + appSelector + '})', 'time() - timestamp(kube_namespace_status_phase{' + appSelector + ',phase="Active"})'], "s")
+                promPanel(16, "App identity / controller conditions", ['digiorg_app_info{' + appSelector + '} or digiorg_registered_app_info{' + appSelector + '}', 'digiorg_app_condition{' + appSelector + '}'], "short")
+                promPanel(17, "StatefulSet / DaemonSet replicas", [
+                    'max by(namespace,statefulset) (kube_statefulset_' + b + '{' + appSelector + '})' for b in ["replicas", "status_replicas_ready"]
+                ] + ['max by(namespace,daemonset) (kube_daemonset_status_' + b + '{' + appSelector + '})' for b in ["desired_number_scheduled", "number_ready"]], "short")
                 logPanel(12, "Logs", [selectedLogQuery], True)
                 logPanel(13, "Log volume", [scopedLogQuery], False)
                 logPanel(14, "Error / warning log counts", [scopedLogQuery + ' AND level.keyword:/([eE][rR][rR]([oO][rR])?|[fF][aA][tT][aA][lL]|[cC][rR][iI][tT][iI][cC][aA][lL])/', scopedLogQuery + ' AND level.keyword:/[wW][aA][rR][nN]([iI][nN][gG])?/'], False)
@@ -2201,7 +2205,7 @@ spec:
             dashboardDoc = {
                 uid = dashboardUid
                 title = "App · ${appName}"
-                description = "Shared operator view, not tenant isolation. Services: " + ", ".join([s.name for s in services])
+                description = "Shared operator view, not tenant isolation. Namespace: ${appName}; Team: ${team}; Services: " + ", ".join([s.name for s in services])
                 schemaVersion = 39
                 version = 1
                 editable = False
