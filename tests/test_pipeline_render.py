@@ -73,10 +73,12 @@ class BaseAlwaysPresentTest(unittest.TestCase):
         self.assertEqual(sa["metadata"]["namespace"], "myapp")
 
     def test_no_optional_resources_when_everything_disabled(self):
-        # Disabled database/gitea/messaging and no services must render
-        # nothing beyond the five base resources -- no silent extras.
+        # Issue375 adds a non-workload inventory requirement, never an optional capability.
         self.assertEqual(len(manifests_of_kind(self.items, "Cluster")), 0)
-        self.assertEqual(len(self.items), 5)
+        self.assertEqual(len(self.items), 6)
+        requests = by_kind(self.items, "RequiredResources")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(set(requests[0]["requirements"]), {"dashboardApplications", "targetNamespace"})
 
 
 class DatabaseFailClosedTest(unittest.TestCase):
@@ -87,7 +89,9 @@ class DatabaseFailClosedTest(unittest.TestCase):
     def test_disabled_renders_nothing_database_related(self):
         items = render({"oxr": make_oxr(database={"enabled": False})})
         self.assertEqual(len(manifests_of_kind(items, "Cluster")), 0)
-        self.assertEqual(len(by_kind(items, "RequiredResources")), 0)
+        requests = by_kind(items, "RequiredResources")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(set(requests[0]["requirements"]), {"dashboardApplications", "targetNamespace"})
         self.assertEqual(len(by_kind(items, "Conditions")), 0)
 
     def test_enabled_without_cnpg_ready_fails_closed_no_cluster(self):
@@ -98,8 +102,8 @@ class DatabaseFailClosedTest(unittest.TestCase):
             "no Cluster may be created before CNPG readiness is confirmed",
         )
         required = by_kind(items, "RequiredResources")
-        self.assertEqual(len(required), 1)
-        reqs = required[0]["requirements"]
+        self.assertEqual(len(required), 2)
+        reqs = next(r["requirements"] for r in required if "cnpgCrd" in r["requirements"])
         self.assertEqual(reqs["cnpgCrd"]["kind"], "CustomResourceDefinition")
         self.assertEqual(reqs["cnpgCrd"]["name"], "clusters.postgresql.cnpg.io")
         self.assertEqual(
