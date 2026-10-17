@@ -2022,7 +2022,6 @@ spec:
                 currentRobotCredentialDescription,
             )
 
-            giteaItems = [giteaRepoRequest] if giteaEnabled else []
             harborRobotItems = [harborRobotRequest] if targetNamespaceReady else []
             cicdPrerequisiteItems = [harborRobotCredentialRequiredResourcesRequest, harborProjectRequest] + harborRobotItems + [harborRobotNameToGiteaSecret, harborRobotSecretToGiteaSecret]
             cicdWorkflowItems = [giteaCiWorkflowRequest] if (giteaRepoReady and workflowCredentialsReady and sourceScaffoldsReady) else []
@@ -2057,7 +2056,85 @@ spec:
             ] if promotionEnabled else []
             statusPatchItems = [{apiVersion = oxr.apiVersion, kind = oxr.kind, status.services = statusServices}] if promotionEnabled else []
 
-            items = baseItems + databaseItems + serviceItems + messagingItems + giteaItems + cicdItems + promotionItems + statusPatchItems
+            # Issue #372: initial enrollment only. Stable Job retained after completion;
+            # no token/generation naming, no TTL and no automatic Job retries.
+            _sonarJob = k8sObject("sonarqube-enrollment", {
+                apiVersion = "batch/v1"
+                kind = "Job"
+                metadata = {name = "${appName}-sonarqube-v1", namespace = "crossplane-system"}
+                spec = {
+                    backoffLimit = 0
+                    activeDeadlineSeconds = 300
+                    template.spec = {
+                        automountServiceAccountToken = False
+                        restartPolicy = "Never"
+                        securityContext = {runAsNonRoot = True, runAsUser = 65534, runAsGroup = 65534, fsGroup = 65534, seccompProfile.type = "RuntimeDefault"}
+                        containers = [{
+                            name = "enroll"
+                            image = "docker.io/library/python:3.12.13-alpine3.23@sha256:601d3d3797e90e2534782e69c85fafb7971b43f24c7b1b079b7e48dd435e458d"
+                            command = ["python3", "-B", "/runner/enroll.py"]
+                            env = [
+                                {name = "APP_NAME", value = appName}
+                                {name = "XR_UID", value = oxr.metadata?.uid or ""}
+                            ]
+                            securityContext = {allowPrivilegeEscalation = False, readOnlyRootFilesystem = True, capabilities.drop = ["ALL"]}
+                            resources = {requests = {cpu = "10m", memory = "32Mi"}, limits = {cpu = "100m", memory = "64Mi"}}
+                            volumeMounts = [
+                                {name = "runner", mountPath = "/runner", readOnly = True}
+                                {name = "token", mountPath = "/var/run/sonarqube", readOnly = True}
+                                {name = "ca", mountPath = "/var/run/digiorg-ca", readOnly = True}
+                                {name = "adoptions", mountPath = "/var/run/adoptions", readOnly = True}
+                            ]
+                        }]
+                        volumes = [
+                            {name = "runner", configMap.name = "sonarqube-onboarding-runner-v1"}
+                            {name = "token", secret = {secretName = "crossplane-sonarqube-credentials", items = [{key = "token", path = "token"}]}}
+                            {name = "ca", secret = {secretName = "digiorg-local-ca", items = [{key = "ca.crt", path = "ca.crt"}]}}
+                            {name = "adoptions", secret = {secretName = "crossplane-sonarqube-adoptions", optional = True}}
+                        ]
+                    }
+                }
+            })
+            _sonarJob.spec.readiness = {
+                policy = "DeriveFromCelQuery"
+                celQuery = "has(object.status) && has(object.status.conditions) && object.status.conditions.exists(c, c.type == \"Complete\" && c.status == \"True\") && !object.status.conditions.exists(c, c.type == \"Failed\" && c.status == \"True\")"
+            }
+            sonarInventoryRequest = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "RequiredResources"
+                requirements.sonarqubeApplications = {
+                    apiVersion = "platform.digiorg.io/v1alpha1"
+                    kind = "Application"
+                    matchLabels = {}
+                }
+            }
+            sonarUid = asStr(oxr.metadata?.uid)
+            sonarSameApps = [r.Resource for r in (required?.sonarqubeApplications or []) if r?.Resource?.spec?.appName == appName]
+            sonarUnique = (sonarUid != "") and len(sonarSameApps) == 1 and asStr(sonarSameApps[0]?.metadata?.uid) == sonarUid
+            sonarObserved = ocds["sonarqube-enrollment"] or {}
+            sonarReady = sonarUnique and isReadyConditionTrue(sonarObserved)
+            sonarReason = "Enrolled" if sonarReady else ("AppIdentityNotUniqueOrUnobserved" if not sonarUnique else ("RepositoryNotReady" if not giteaRepoReady else "EnrollmentJobPendingOrFailed"))
+            sonarCondition = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "Conditions"
+                conditions = [{
+                    target = "CompositeAndClaim"
+                    force = True
+                    condition = {
+                        type = "SonarQubeEnrollmentReady"
+                        status = "True" if sonarReady else "False"
+                        reason = sonarReason
+                        message = "${sonarReason}: digiorg:gitea:DigiOrg:${appName}; enrollment is not analysis. Inspect crossplane-system/${appName}-sonarqube-v1 sanitized logs for failure reason."
+                    }
+                }]
+            }
+            _sonarGiteaRepoRequest = giteaRepoRequest
+            if not sonarReady:
+                _sonarGiteaRepoRequest.metadata.annotations["krm.kcl.dev/ready"] = "False"
+            giteaItems = [_sonarGiteaRepoRequest] if giteaEnabled else []
+            sonarItems = [sonarInventoryRequest, sonarCondition] + ([_sonarJob] if (sonarUnique and (giteaRepoReady or len(sonarObserved) > 0)) else []) if giteaEnabled else []
+
+            items = baseItems + databaseItems + serviceItems + messagingItems + giteaItems + cicdItems + promotionItems + statusPatchItems + sonarItems
 
     - step: automatically-detect-ready-composed-resources
       functionRef:

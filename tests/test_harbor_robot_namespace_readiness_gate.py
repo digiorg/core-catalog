@@ -73,7 +73,7 @@ class HarborRobotNamespaceReadinessGateTest(unittest.TestCase):
             ) == "namespace"
         ]
         self.assertEqual(len(namespaces), 1)
-        required_items = [x for x in items if x.get("kind") == "RequiredResources"]
+        required_items = [x for x in items if x.get("kind") == "RequiredResources" and "targetNamespace" in x.get("requirements", {})]
         self.assertEqual(len(required_items), 1)
         requirement = required_items[0]["requirements"]["targetNamespace"]
         self.assertEqual(requirement["apiVersion"], "v1")

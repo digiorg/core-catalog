@@ -106,7 +106,7 @@ class WorkflowCredentialGateTest(unittest.TestCase):
         self.assertIn("gitea-secret-harbor-robot-secret", slugs)
         self.assertIn("harbor-robot", slugs)
         self.assertNotIn("gitea-cicd", slugs)
-        self.assertEqual(len([x for x in items if x.get("kind") == "RequiredResources"]), 1)
+        self.assertEqual(len([x for x in items if x.get("kind") == "RequiredResources" and "harborRobotCredential" in x.get("requirements", {})]), 1)
 
     def test_initial_render_with_no_observations_withholds_workflow(self):
         self.assert_secret_requests_without_workflow(_render({}))
