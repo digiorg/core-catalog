@@ -132,6 +132,7 @@ spec:
                     "platform.digiorg.io/team" = team
                     "platform.digiorg.io/size" = size
                     "platform.digiorg.io/type" = "app"
+                    "platform.digiorg.io/app-id" = appName
                 }
             })
 
@@ -2134,7 +2135,127 @@ spec:
             giteaItems = [_sonarGiteaRepoRequest] if giteaEnabled else []
             sonarItems = [sonarInventoryRequest, sonarCondition] + ([_sonarJob] if (sonarUnique and (giteaRepoReady or len(sonarObserved) > 0)) else []) if giteaEnabled else []
 
-            items = baseItems + databaseItems + serviceItems + messagingItems + giteaItems + cicdItems + promotionItems + statusPatchItems + sonarItems
+            # Issue #375: one literal dashboard per logical app, independent of builds.
+            dashboardUid = "app-dev-${appName}"
+            # Grafana variables refine Pod/container selection, never the literal namespace.
+            prometheusDs = {type = "prometheus", uid = "prometheus"}
+            logsDs = {type = "elasticsearch", uid = "$" + "{logs}"}
+            podRegex = "$" + "{pod:regex}"
+            podLucene = "$" + "{pod:lucene}"
+            containerLucene = "$" + "{container:lucene}"
+            appSelector = 'namespace="${appName}"'
+            podSelector = appSelector + ',pod=~"^' + podRegex + '$"'
+            scopedLogQuery = 'kubernetes.namespace_name:"${appName}"'
+            selectedLogQuery = scopedLogQuery + ' AND kubernetes.pod_name:' + podLucene + ' AND kubernetes.container_name:' + containerLucene
+            promPanel = lambda id: int, title: str, exprs: [str], unit: str -> any {
+                {
+                    id = id, title = title, type = "timeseries"
+                    datasource = prometheusDs
+                    gridPos = {x = 0 if id % 2 == 1 else 12, y = (96 + ((id - 16) // 2) * 8) if id >= 16 else ((id - 1) // 2) * 8, w = 12, h = 8}
+                    description = "Dedicated app namespace. No series = Unknown/unavailable, not zero. Service ownership is shown separately; resource panels include support Pods. Requests/limits absent = unset/N/A."
+                    fieldConfig.defaults = {unit = unit, noValue = "Unknown / unset (N/A)"}
+                    targets = [{refId = str(i), expr = expression, legendFormat = "{{pod}} {{container}} {{deployment}} {{reason}}"} for i, expression in exprs]
+                }
+            }
+            logPanel = lambda id: int, title: str, queries: [str], raw: bool -> any {
+                {
+                    id = id, title = title, type = "logs" if raw else "timeseries"
+                    datasource = logsDs
+                    gridPos = {x = 0, y = 64 + (id - 12) * 8, w = 24, h = 8}
+                    description = "Log observations, not request errors or proof of ingestion. Query errors/datasource ambiguity are not successful empty results. Missing levels are retained."
+                    fieldConfig.defaults.noValue = "No logs observed / query unavailable; ingestion unproven"
+                    targets = [{
+                        refId = str(i), query = q, timeField = "@timestamp", alias = q
+                        metrics = [{id = "1", type = "logs", settings.limit = "200"}] if raw else [{id = "1", type = "count"}]
+                        bucketAggs = [] if raw else [{id = "2", type = "date_histogram", field = "@timestamp", settings = {interval = "auto", min_doc_count = 0}}]
+                    } for i, q in queries]
+                    options = {showTime = True, wrapLogMessage = True, sortOrder = "Descending"}
+                }
+            }
+            podDeployment = 'max by(namespace,pod,replicaset) (label_replace(kube_pod_owner{' + appSelector + ',owner_kind="ReplicaSet",owner_is_controller="true"}, "replicaset", "$1", "owner_name", "(.*)")) * on(namespace,replicaset) group_left(deployment) max by(namespace,replicaset,deployment) (label_replace(kube_replicaset_owner{' + appSelector + ',owner_kind="Deployment",owner_is_controller="true"}, "deployment", "$1", "owner_name", "(.*)"))'
+            dashboardPanels = [
+                promPanel(1, "CPU cores", ['sum by(namespace,pod,container) (rate(container_cpu_usage_seconds_total{' + podSelector + ',container!="",container!="POD",job="kubelet",metrics_path="/metrics/cadvisor"}[5m]))'], "cores")
+                promPanel(2, "Memory working set", ['sum by(namespace,pod,container) (container_memory_working_set_bytes{' + podSelector + ',container!="",container!="POD",job="kubelet",metrics_path="/metrics/cadvisor"})'], "bytes")
+                promPanel(3, "CPU requests / limits", ['sum by(namespace,pod,container) (kube_pod_container_resource_' + b + '{' + podSelector + ',resource="cpu",unit="core"})' for b in ["requests", "limits"]], "cores")
+                promPanel(4, "Memory requests / limits", ['sum by(namespace,pod,container) (kube_pod_container_resource_' + b + '{' + podSelector + ',resource="memory",unit="byte"})' for b in ["requests", "limits"]], "bytes")
+                promPanel(5, "Deployment replicas", ['max by(namespace,deployment) (kube_deployment_' + b + '{' + appSelector + '})' for b in ["spec_replicas", "status_replicas_ready", "status_replicas_available"]], "short")
+                promPanel(6, "Restarts (15m)", ['sum by(namespace,pod) (increase(kube_pod_container_status_restarts_total{' + podSelector + '}[15m]))'], "short")
+                promPanel(7, "Last termination OOM (not event count)", ['max by(namespace,pod) (kube_pod_container_status_last_terminated_reason{' + podSelector + ',reason="OOMKilled"})'], "short")
+                promPanel(8, "Pod waiting / Pending / unschedulable", [
+                    'max by(namespace,pod,reason) (kube_pod_container_status_waiting_reason{' + podSelector + ',reason=~"CrashLoopBackOff|ImagePullBackOff|ErrImagePull"} == 1)'
+                    'max by(namespace,pod) (kube_pod_status_phase{' + podSelector + ',phase="Pending"} == 1)'
+                    'max by(namespace,pod) (kube_pod_status_unschedulable{' + podSelector + '} == 1)'
+                ], "short")
+                promPanel(9, "Pod network RX / TX", ['max by(namespace,pod) (rate(container_network_' + d + '_bytes_total{' + podSelector + ',job="kubelet",metrics_path="/metrics/cadvisor",interface!="lo"}[5m]))' for d in ["receive", "transmit"]], "Bps")
+                promPanel(10, "Service Pod ownership", [
+                    podDeployment
+                    'max by(namespace,pod,owner_kind,owner_name) (kube_pod_owner{' + appSelector + ',owner_kind="StatefulSet",owner_is_controller="true"})'
+                    'max by(namespace,pod,owner_kind,owner_name) (kube_pod_owner{' + appSelector + ',owner_kind="DaemonSet",owner_is_controller="true"})'
+                ], "short")
+                promPanel(11, "Telemetry confidence", ['time() - timestamp(digiorg_app_info{' + appSelector + '})', 'time() - timestamp(kube_namespace_status_phase{' + appSelector + ',phase="Active"})'], "s")
+                promPanel(16, "App identity / controller conditions", ['digiorg_app_info{' + appSelector + '} or digiorg_registered_app_info{' + appSelector + '}', 'digiorg_app_condition{' + appSelector + '}'], "short")
+                promPanel(17, "StatefulSet / DaemonSet replicas", [
+                    'max by(namespace,statefulset) (kube_statefulset_' + b + '{' + appSelector + '})' for b in ["replicas", "status_replicas_ready"]
+                ] + ['max by(namespace,daemonset) (kube_daemonset_status_' + b + '{' + appSelector + '})' for b in ["desired_number_scheduled", "number_ready"]], "short")
+                logPanel(12, "Logs", [selectedLogQuery], True)
+                logPanel(13, "Log volume", [scopedLogQuery], False)
+                logPanel(14, "Error / warning log counts", [scopedLogQuery + ' AND level.keyword:/([eE][rR][rR]([oO][rR])?|[fF][aA][tT][aA][lL]|[cC][rR][iI][tT][iI][cC][aA][lL])/', scopedLogQuery + ' AND level.keyword:/[wW][aA][rR][nN]([iI][nN][gG])?/'], False)
+                logPanel(15, "Level coverage", [scopedLogQuery + ' AND _exists_:level.keyword', scopedLogQuery + ' AND NOT _exists_:level.keyword'], False)
+            ]
+            dashboardDoc = {
+                uid = dashboardUid
+                title = "App · ${appName}"
+                description = "Shared operator view, not tenant isolation. Namespace: ${appName}; Team: ${team}; Services: " + ", ".join([s.name for s in services])
+                schemaVersion = 39
+                version = 1
+                editable = False
+                refresh = "30s"
+                time = {from = "now-1h", to = "now"}
+                templating.list = [
+                    {name = "logs", label = "Logs datasource (must match exactly once)", type = "datasource", query = "elasticsearch", regex = r'/^OpenSearch \(Logs\)$/', refresh = 1, multi = False, includeAll = False, skipUrlSync = True}
+                    {name = "pod", type = "query", datasource = prometheusDs, query = 'label_values(kube_pod_info{' + appSelector + '},pod)', refresh = 2, multi = True, includeAll = True, allValue = ".*", current = {text = "All", value = "$" + "__all"}}
+                    {name = "container", type = "query", datasource = prometheusDs, query = 'label_values(kube_pod_container_info{' + appSelector + '},container)', refresh = 2, multi = True, includeAll = True, allValue = "*", current = {text = "All", value = "$" + "__all"}}
+                ]
+                links = [{title = "App health overview", url = "/grafana/d/digiorg-app-health", includeVars = False, keepTime = True}]
+                panels = dashboardPanels
+            }
+            dashboardJson = json.encode(dashboardDoc)
+            _dashboardObject = k8sObject("grafana-dashboard", {
+                apiVersion = "v1"
+                kind = "ConfigMap"
+                metadata = {
+                    name = "grafana-${dashboardUid}"
+                    namespace = appName
+                    labels = {grafana_dashboard = "1"}
+                    annotations = {
+                        grafana_folder = "/tmp/dashboards/DigiOrg Apps"
+                        "platform.digiorg.io/dashboard-owner" = oxr.metadata?.uid or ""
+                        "platform.digiorg.io/app-id" = appName
+                        "platform.digiorg.io/dashboard-version" = "1"
+                        "platform.digiorg.io/dashboard-sha256" = crypto.sha256(dashboardJson)
+                    }
+                }
+                data = {"${dashboardUid}.json" = dashboardJson}
+            })
+            _dashboardObject.metadata.annotations["krm.kcl.dev/ready"] = "True"
+            _dashboardObject.spec.deletionPolicy = "Delete"
+            _dashboardObject.spec.managementPolicies = ["Observe", "Create", "Update", "Delete"]
+            dashboardInventoryRequest = {
+                apiVersion = "meta.krm.kcl.dev/v1alpha1"
+                kind = "RequiredResources"
+                requirements = {
+                    dashboardApplications = {apiVersion = "platform.digiorg.io/v1alpha1", kind = "Application", matchLabels = {}}
+                    # CI already requests this exact namespace; avoid duplicate requirement keys.
+                    if not giteaCicd:
+                        targetNamespace = {apiVersion = "v1", kind = "Namespace", name = appName}
+                }
+            }
+            dashboardOwners = [r.Resource for r in (required?.dashboardApplications or []) if r?.Resource?.spec?.appName == appName]
+            dashboardIdentityValid = regex.match(appName, r'^[a-z]([a-z0-9-]{0,30}[a-z0-9])?$') and len(appName) <= 32 and (oxr.metadata?.uid or "") != ""
+            dashboardUnique = len(dashboardOwners) == 1 and (dashboardOwners[0]?.metadata?.uid or "") == (oxr.metadata?.uid or "")
+            dashboardItems = [dashboardInventoryRequest] + ([_dashboardObject] if dashboardIdentityValid and dashboardUnique and targetNamespaceReady else [])
+
+            items = baseItems + databaseItems + serviceItems + messagingItems + giteaItems + cicdItems + promotionItems + statusPatchItems + sonarItems + dashboardItems
 
     - step: automatically-detect-ready-composed-resources
       functionRef:
